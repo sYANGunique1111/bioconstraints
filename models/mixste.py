@@ -1,0 +1,968 @@
+"""
+MixSTE2: Mixed Spatio-Temporal Encoder
+Revised from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
+"""
+
+import math
+from functools import partial
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from einops import rearrange
+from timm.layers import DropPath, trunc_normal_
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., comb=False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.comb = comb
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        
+        if self.comb:
+            attn = (q.transpose(-2, -1) @ k) * self.scale
+        else:
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        if self.comb:
+            x = (attn @ v.transpose(-2, -1)).transpose(-2, -1)
+            x = rearrange(x, 'B H N C -> B N (H C)')
+        else:
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class Block(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, comb=False):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, 
+            attn_drop=attn_drop, proj_drop=drop, comb=comb)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+
+class MixSTE2(nn.Module):
+    """
+    Mixed Spatio-Temporal Encoder for 2D-to-3D pose estimation.
+    
+    Args:
+        num_frame (int): input frame number
+        num_joints (int): joints number
+        in_chans (int): number of input channels, 2D joints have 2 channels: (x,y)
+        embed_dim_ratio (int): embedding dimension ratio
+        depth (int): depth of transformer
+        num_heads (int): number of attention heads
+        mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+        qkv_bias (bool): enable bias for qkv if True
+        qk_scale (float): override default qk scale of head_dim ** -0.5 if set
+        drop_rate (float): dropout rate
+        attn_drop_rate (float): attention dropout rate
+        drop_path_rate (float): stochastic depth rate
+        norm_layer: (nn.Module): normalization layer
+    """
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None):
+        super().__init__()
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        embed_dim = embed_dim_ratio
+        out_dim = 3  # output dimension is 3 (x, y, z)
+
+        # Spatial patch embedding
+        self.Spatial_patch_to_embedding = nn.Linear(in_chans, embed_dim_ratio)
+        self.Spatial_pos_embed = nn.Parameter(torch.zeros(1, num_joints, embed_dim_ratio))
+
+        self.Temporal_pos_embed = nn.Parameter(torch.zeros(1, num_frame, embed_dim))
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.block_depth = depth
+
+        self.STEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)])
+
+        self.TTEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, comb=False)
+            for i in range(depth)])
+
+        self.Spatial_norm = norm_layer(embed_dim_ratio)
+        self.Temporal_norm = norm_layer(embed_dim)
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, out_dim),
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def STE_forward(self, x):
+        """Spatial Transformer Encoder forward pass."""
+        b, f, n, c = x.shape
+        x = rearrange(x, 'b f n c -> (b f) n c')
+        x = self.Spatial_patch_to_embedding(x)
+        x += self.Spatial_pos_embed
+        x = self.pos_drop(x)
+
+        blk = self.STEblocks[0]
+        x = blk(x)
+
+        x = self.Spatial_norm(x)
+        x = rearrange(x, '(b f) n cw -> (b n) f cw', f=f)
+        return x
+
+    def TTE_forward(self, x):
+        """Temporal Transformer Encoder forward pass."""
+        assert len(x.shape) == 3, "shape should be 3"
+        b, f, _ = x.shape
+        x += self.Temporal_pos_embed
+        x = self.pos_drop(x)
+        blk = self.TTEblocks[0]
+        x = blk(x)
+        x = self.Temporal_norm(x)
+        return x
+
+    def ST_forward(self, x):
+        """Alternating Spatio-Temporal forward pass."""
+        assert len(x.shape) == 4, "shape should be 4"
+        b, f, n, cw = x.shape
+        for i in range(1, self.block_depth):
+            x = rearrange(x, 'b f n cw -> (b f) n cw')
+            steblock = self.STEblocks[i]
+            tteblock = self.TTEblocks[i]
+            
+            x = steblock(x)
+            x = self.Spatial_norm(x)
+            x = rearrange(x, '(b f) n cw -> (b n) f cw', f=f)
+
+            x = tteblock(x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) f cw -> b f n cw', n=n)
+        
+        return x
+
+    def forward(self, x):
+        """
+        Forward pass.
+        
+        Args:
+            x: Input 2D poses of shape (batch, frames, joints, 2)
+            
+        Returns:
+            3D poses of shape (batch, frames, joints, 3)
+        """
+        b, f, n, c = x.shape
+        
+        x = self.STE_forward(x)
+        x = self.TTE_forward(x)
+        x = rearrange(x, '(b n) f cw -> b f n cw', n=n)
+        x = self.ST_forward(x)
+        x = self.head(x)
+        x = x.view(b, f, n, -1)
+
+        return x
+
+
+class HybridMixSTEEmbedder(nn.Module):
+    """
+    Hybrid Pose Embedder that groups joints by body parts and applies temporal patching.
+    
+    Unlike HybridPoseEmbedder3_2 which flattens the output, this keeps spatial and temporal
+    dimensions separate to fit MixSTE's alternating spatial-temporal processing.
+    
+    Output shape: (B, T_patches, num_groups, hidden_size)
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, in_channels=2, 
+                 hidden_size=512, joint_groups=None, bias=True):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.hidden_size = hidden_size
+        
+        # Default H36M 17-joint skeleton groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        
+        self.num_time_patches = num_frame // patch_size
+        
+        # Body part embedders (grouped joints -> 1 token per group per time patch)
+        self.part_projs = nn.ModuleList()
+        for group in self.joint_groups:
+            dim = in_channels * patch_size * len(group)
+            self.part_projs.append(nn.Linear(dim, hidden_size, bias=bias))
+        
+        # Fixed Positional Embeddings (sinusoidal)
+        # Temporal PE: for each time patch
+        temporal_pe = self._create_sinusoidal_pe(self.num_time_patches, hidden_size)
+        self.register_buffer('temporal_pe', temporal_pe)  # (1, num_time_patches, hidden_size)
+        
+        # Body Identity PE: for each body part group
+        body_pe = self._create_sinusoidal_pe(self.num_groups, hidden_size)
+        self.register_buffer('body_pe', body_pe)  # (1, num_groups, hidden_size)
+    
+    def _create_sinusoidal_pe(self, num_positions, dim):
+        """Create fixed sinusoidal positional embeddings."""
+        pe = torch.zeros(1, num_positions, dim)
+        position = torch.arange(0, num_positions, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        
+        return pe
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, J, C) - 2D poses
+            
+        Returns:
+            tokens: (B, T_patches, num_groups, hidden_size) - NOT flattened
+        """
+        B, T, J, C = x.shape
+        P_t = self.patch_size
+        T_patches = T // P_t
+        
+        # Convert to (B, C, T, J) for grouped processing
+        x_perm = x.permute(0, 3, 1, 2)  # (B, C, T, J)
+        
+        part_tokens = []
+        for i, group in enumerate(self.joint_groups):
+            # Select joints: (B, C, T, group_size)
+            x_g = x_perm[:, :, :, group]
+            
+            # Reshape: (B, C, T_patches, P_t, group_size)
+            x_g = x_g.reshape(B, C, T_patches, P_t, len(group))
+            
+            # Permute to (B, T_patches, C, P_t, group_size)
+            x_g = x_g.permute(0, 2, 1, 3, 4).contiguous()
+            
+            # Flatten to (B, T_patches, C * P_t * group_size)
+            x_g = x_g.view(B, T_patches, -1)                            
+            
+            # Project
+            embed = self.part_projs[i](x_g)  # (B, T_patches, hidden_size)
+            part_tokens.append(embed)
+        
+        # Stack part tokens: (B, T_patches, num_groups, hidden_size)
+        part_tokens = torch.stack(part_tokens, dim=2)
+        
+        # Add positional embeddings
+        # Temporal PE: broadcast across groups
+        temporal_pe_expanded = self.temporal_pe.unsqueeze(2)  # (1, T_patches, 1, D)
+        # Body PE: broadcast across time patches
+        body_pe_expanded = self.body_pe.unsqueeze(1)  # (1, 1, num_groups, D)
+        
+        part_tokens = part_tokens + temporal_pe_expanded + body_pe_expanded
+        
+        return part_tokens
+
+
+class HybridMixSTEDecoder(nn.Module):
+    """
+    Decoder for HybridMixSTE that maps body-part tokens back to joint predictions.
+    
+    Supports two modes:
+    - "overlap_average" (default): Each group predicts all its joints, overlapping 
+      predictions are averaged. More expressive but has redundancy.
+    - "group_only": Each group only predicts its own joints. No overlap, simpler.
+    
+    Input: (B, T_patches, num_groups, hidden_size)
+    Output: (B, T, J, out_channels)
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, hidden_size=512,
+                 out_channels=3, joint_groups=None, decoder_mode="overlap_average"):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        self.decoder_mode = decoder_mode
+        
+        # Default H36M 17-joint skeleton groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        
+        self.num_time_patches = num_frame // patch_size
+        
+        # Part decoders: each predicts its group joints for patch_size frames
+        self.part_heads = nn.ModuleList()
+        for group in self.joint_groups:
+            out_dim = patch_size * len(group) * out_channels
+            self.part_heads.append(nn.Linear(hidden_size, out_dim))
+    
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, num_groups, hidden_size) - body part tokens
+            
+        Returns:
+            poses_3d: (B, T, J, out_channels)
+        """
+        B = tokens.shape[0]
+        T_patches = self.num_time_patches
+        P_t = self.patch_size
+        T = T_patches * P_t
+        J = self.num_joints
+        C_out = self.out_channels
+        
+        if self.decoder_mode == "overlap_average":
+            return self._decode_overlap_average(tokens, B, T_patches, P_t, T, J, C_out)
+        else:  # "group_only"
+            return self._decode_group_only(tokens, B, T_patches, P_t, T, J, C_out)
+    
+    def _decode_overlap_average(self, tokens, B, T_patches, P_t, T, J, C_out):
+        """Decode with overlapping predictions averaged."""
+        # Initialize output accumulator and count for averaging overlaps
+        output = torch.zeros(B, T, J, C_out, device=tokens.device, dtype=tokens.dtype)
+        count = torch.zeros(B, T, J, 1, device=tokens.device, dtype=tokens.dtype)
+        
+        # Decode part tokens
+        for i, group in enumerate(self.joint_groups):
+            part_tokens = tokens[:, :, i, :]  # (B, T_patches, hidden_size)
+            part_pred = self.part_heads[i](part_tokens)  # (B, T_patches, P_t * group_size * C_out)
+            
+            group_size = len(group)
+            part_pred = part_pred.view(B, T_patches, P_t, group_size, C_out)
+            part_pred = part_pred.view(B, T, group_size, C_out)
+            
+            # Add to corresponding joint positions (handles overlaps)
+            for j, joint_idx in enumerate(group):
+                output[:, :, joint_idx, :] = output[:, :, joint_idx, :] + part_pred[:, :, j, :]
+                count[:, :, joint_idx, :] = count[:, :, joint_idx, :] + 1
+        
+        # Average overlapping predictions
+        output = output / count.clamp(min=1)
+        
+        return output
+    
+    def _decode_group_only(self, tokens, B, T_patches, P_t, T, J, C_out):
+        """Decode with each group only predicting its own joints (no overlap)."""
+        output = torch.zeros(B, T, J, C_out, device=tokens.device, dtype=tokens.dtype)
+        
+        for i, group in enumerate(self.joint_groups):
+            part_tokens = tokens[:, :, i, :]  # (B, T_patches, hidden_size)
+            part_pred = self.part_heads[i](part_tokens)  # (B, T_patches, P_t * group_size * C_out)
+            
+            group_size = len(group)
+            part_pred = part_pred.view(B, T_patches, P_t, group_size, C_out)
+            part_pred = part_pred.view(B, T, group_size, C_out)
+            
+            # Directly assign to joint positions
+            for j, joint_idx in enumerate(group):
+                output[:, :, joint_idx, :] = part_pred[:, :, j, :]
+        
+        return output
+
+
+class HybridMixSTE(nn.Module):
+    """
+    Hybrid Mixed Spatio-Temporal Encoder combining body-part grouping with 
+    MixSTE's alternating spatial-temporal processing.
+    
+    Key differences from MixSTE2:
+    - Spatial tokens are body part groups (5 by default) instead of individual joints (17)
+    - Temporal dimension uses patching for efficiency
+    - Uses sinusoidal positional embeddings instead of learnable
+    
+    Args:
+        num_frame (int): input frame number
+        num_joints (int): joints number
+        in_chans (int): number of input channels, 2D joints have 2 channels: (x,y)
+        embed_dim_ratio (int): embedding dimension ratio
+        depth (int): depth of transformer
+        num_heads (int): number of attention heads
+        mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+        qkv_bias (bool): enable bias for qkv if True
+        qk_scale (float): override default qk scale of head_dim ** -0.5 if set
+        drop_rate (float): dropout rate
+        attn_drop_rate (float): attention dropout rate
+        drop_path_rate (float): stochastic depth rate
+        norm_layer: (nn.Module): normalization layer
+        patch_size (int): temporal patch size
+        joint_groups (list): list of joint index lists for body parts
+        decoder_mode (str): "overlap_average" or "group_only"
+    """
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
+                 patch_size=9, joint_groups=None, decoder_mode="overlap_average"):
+        super().__init__()
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        embed_dim = embed_dim_ratio
+        out_dim = 3
+
+        # Default joint groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        self.num_time_patches = num_frame // patch_size
+        
+        # Hybrid Embedder (outputs (B, T_patches, num_groups, hidden_size))
+        self.embedder = HybridMixSTEEmbedder(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            in_channels=in_chans,
+            hidden_size=embed_dim_ratio,
+            joint_groups=joint_groups
+        )
+
+        self.gamma = nn.Parameter(torch.ones(1, 1, self.num_groups, embed_dim_ratio))
+        self.beta = nn.Parameter(torch.zeros(1, 1, self.num_groups, embed_dim_ratio))
+        
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.block_depth = depth
+
+        # Spatial Transformer blocks (attention over body part groups)
+        self.STEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)])
+
+        # Temporal Transformer blocks (attention over time patches)
+        self.TTEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, comb=False)
+            for i in range(depth)])
+
+        self.Spatial_norm = norm_layer(embed_dim_ratio)
+        self.Temporal_norm = norm_layer(embed_dim)
+
+        # Decoder
+        self.decoder = HybridMixSTEDecoder(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            hidden_size=embed_dim_ratio,
+            out_channels=out_dim,
+            joint_groups=joint_groups,
+            decoder_mode=decoder_mode
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    # def STE_forward(self, x):
+    #     """Spatial Transformer Encoder forward pass (attention over body part groups)."""
+    #     b, t, n, c = x.shape  # (B, T_patches, num_groups, hidden_size)
+    #     x = rearrange(x, 'b t n c -> (b t) n c')
+    #     x = self.pos_drop(x)
+
+    #     blk = self.STEblocks[0]
+    #     x = blk(x)
+
+    #     x = self.Spatial_norm(x)
+    #     x = rearrange(x, '(b t) n c -> (b n) t c', t=t)
+    #     return x
+
+    # def TTE_forward(self, x):
+    #     """Temporal Transformer Encoder forward pass (attention over time patches)."""
+    #     assert len(x.shape) == 3, "shape should be 3"
+    #     x = self.pos_drop(x)
+    #     blk = self.TTEblocks[0]
+    #     x = blk(x)
+    #     x = self.Temporal_norm(x)
+    #     return x
+
+    def ST_forward(self, x):
+        """Alternating Spatio-Temporal forward pass."""
+        assert len(x.shape) == 4, "shape should be 4"
+        b, t, n, c = x.shape  # (B, T_patches, num_groups, hidden_size)
+        for i in range(self.block_depth):
+            x = rearrange(x, 'b t n c -> (b t) n c')
+            steblock = self.STEblocks[i]
+            tteblock = self.TTEblocks[i]
+            
+            x = steblock(x)
+            x = self.Spatial_norm(x)
+            x = rearrange(x, '(b t) n c -> (b n) t c', t=t)
+
+            x = tteblock(x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) t c -> b t n c', n=n)
+        
+        return x
+
+    def forward(self, x):
+        """
+        Forward pass.
+        
+        Args:
+            x: Input 2D poses of shape (batch, frames, joints, 2)
+            
+        Returns:
+            3D poses of shape (batch, frames, joints, 3)
+        """
+        b, f, j, c = x.shape
+        
+        # Embed: (B, T, J, 2) -> (B, T_patches, num_groups, hidden_size)
+        x = self.embedder(x)
+        x = F.layer_norm(x, (x.shape[-1],), weight=None, bias=None, eps=1e-6)
+        x = x * self.gamma + self.beta
+        
+        # First spatial-temporal pass
+        # x = self.STE_forward(x)  # -> (B*num_groups, T_patches, hidden_size)
+        # x = self.TTE_forward(x)  # -> (B*num_groups, T_patches, hidden_size)
+        # x = rearrange(x, '(b n) t c -> b t n c', n=self.num_groups)
+        
+        # Alternating spatial-temporal blocks
+        x = self.ST_forward(x)  # -> (B, T_patches, num_groups, hidden_size)
+        
+        # Decode: (B, T_patches, num_groups, hidden_size) -> (B, T, J, 3)
+        x = self.decoder(x)
+
+        return x
+
+
+class HybridMixSTEEmbedderV2(nn.Module):
+    """
+    Hybrid Pose Embedder with proper spatiotemporal patchification (V2).
+    
+    Each (time_patch, group) combination is treated as a unique patch position
+    and has its own projection layer, similar to ViT's patch embedding.
+    
+    Total projections: T_patches × N_groups
+    
+    Output shape: (B, T_patches, num_groups, hidden_size)
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, in_channels=2, 
+                 hidden_size=512, joint_groups=None, bias=True):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.hidden_size = hidden_size
+        
+        # Default H36M 17-joint skeleton groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        
+        self.num_time_patches = num_frame // patch_size
+        
+        # Create separate projection for each (time_patch, group) position
+        # Organized as: patch_projs[group_idx][time_patch_idx]
+        self.patch_projs = nn.ModuleList()
+        for g_idx, group in enumerate(self.joint_groups):
+            group_projs = nn.ModuleList()
+            patch_dim = in_channels * patch_size * len(group)
+            for t_idx in range(self.num_time_patches):
+                group_projs.append(nn.Linear(patch_dim, hidden_size, bias=bias))
+            self.patch_projs.append(group_projs)
+        
+        # Fixed Positional Embeddings (sinusoidal)
+        # Temporal PE: for each time patch
+        temporal_pe = self._create_sinusoidal_pe(self.num_time_patches, hidden_size)
+        self.register_buffer('temporal_pe', temporal_pe)  # (1, num_time_patches, hidden_size)
+        
+        # Body Identity PE: for each body part group
+        body_pe = self._create_sinusoidal_pe(self.num_groups, hidden_size)
+        self.register_buffer('body_pe', body_pe)  # (1, num_groups, hidden_size)
+    
+    def _create_sinusoidal_pe(self, num_positions, dim):
+        """Create fixed sinusoidal positional embeddings."""
+        pe = torch.zeros(1, num_positions, dim)
+        position = torch.arange(0, num_positions, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+        
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+        
+        return pe
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, J, C) - 2D poses
+            
+        Returns:
+            tokens: (B, T_patches, num_groups, hidden_size) - NOT flattened
+        """
+        B, T, J, C = x.shape
+        P_t = self.patch_size
+        T_patches = T // P_t
+        
+        # Convert to (B, C, T, J) for grouped processing
+        x_perm = x.permute(0, 3, 1, 2)  # (B, C, T, J)
+        
+        # Process each group and time patch with unique projection
+        all_tokens = []
+        for g_idx, group in enumerate(self.joint_groups):
+            # Select joints: (B, C, T, group_size)
+            x_g = x_perm[:, :, :, group]
+            
+            # Reshape: (B, C, T_patches, P_t, group_size)
+            x_g = x_g.reshape(B, C, T_patches, P_t, len(group))
+            
+            # Permute to (B, T_patches, C, P_t, group_size)
+            x_g = x_g.permute(0, 2, 1, 3, 4).contiguous()
+            
+            # Flatten spatial dims: (B, T_patches, C * P_t * group_size)
+            x_g = x_g.view(B, T_patches, -1)
+            
+            # Apply unique projection for each time patch
+            group_tokens = []
+            for t_idx in range(T_patches):
+                # Extract patch at time position t_idx: (B, patch_dim)
+                patch = x_g[:, t_idx, :]
+                # Project with position-specific projection
+                token = self.patch_projs[g_idx][t_idx](patch)  # (B, hidden_size)
+                group_tokens.append(token)
+            
+            # Stack: (B, T_patches, hidden_size)
+            group_tokens = torch.stack(group_tokens, dim=1)
+            all_tokens.append(group_tokens)
+        
+        # Stack all groups: (B, T_patches, num_groups, hidden_size)
+        part_tokens = torch.stack(all_tokens, dim=2)
+        
+        # Add positional embeddings
+        # Temporal PE: broadcast across groups
+        temporal_pe_expanded = self.temporal_pe.unsqueeze(2)  # (1, T_patches, 1, D)
+        # Body PE: broadcast across time patches
+        body_pe_expanded = self.body_pe.unsqueeze(1)  # (1, 1, num_groups, D)
+        
+        part_tokens = part_tokens + temporal_pe_expanded + body_pe_expanded
+        
+        return part_tokens
+
+
+class HybridMixSTEV2(nn.Module):
+    """
+    Hybrid Mixed Spatio-Temporal Encoder V2 with proper per-patch patchification.
+    
+    Key differences from HybridMixSTE:
+    - Uses HybridMixSTEEmbedderV2 with unique projection per (time_patch, group)
+    - Simplified unified forward loop for all depth blocks
+    
+    Args:
+        num_frame (int): input frame number
+        num_joints (int): joints number
+        in_chans (int): number of input channels, 2D joints have 2 channels: (x,y)
+        embed_dim_ratio (int): embedding dimension ratio
+        depth (int): depth of transformer
+        num_heads (int): number of attention heads
+        mlp_ratio (int): ratio of mlp hidden dim to embedding dim
+        qkv_bias (bool): enable bias for qkv if True
+        qk_scale (float): override default qk scale of head_dim ** -0.5 if set
+        drop_rate (float): dropout rate
+        attn_drop_rate (float): attention dropout rate
+        drop_path_rate (float): stochastic depth rate
+        norm_layer: (nn.Module): normalization layer
+        patch_size (int): temporal patch size
+        joint_groups (list): list of joint index lists for body parts
+        decoder_mode (str): "overlap_average" or "group_only"
+    """
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
+                 patch_size=9, joint_groups=None, decoder_mode="overlap_average"):
+        super().__init__()
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        embed_dim = embed_dim_ratio
+        out_dim = 3
+
+        # Default joint groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        self.num_time_patches = num_frame // patch_size
+        
+        # V2 Embedder with proper per-patch projections
+        self.embedder = HybridMixSTEEmbedderV2(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            in_channels=in_chans,
+            hidden_size=embed_dim_ratio,
+            joint_groups=joint_groups
+        )
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        self.block_depth = depth
+
+        # Spatial Transformer blocks (attention over body part groups)
+        self.STEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)])
+
+        # Temporal Transformer blocks (attention over time patches)
+        self.TTEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, comb=False)
+            for i in range(depth)])
+
+        self.Embedder_norm = norm_layer(embed_dim_ratio)
+        self.Spatial_norm = norm_layer(embed_dim_ratio)
+        self.Temporal_norm = norm_layer(embed_dim)
+
+        # Decoder
+        self.decoder = HybridMixSTEDecoder(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            hidden_size=embed_dim_ratio,
+            out_channels=out_dim,
+            joint_groups=joint_groups,
+            decoder_mode=decoder_mode
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x):
+        """
+        Forward pass.
+        
+        Args:
+            x: Input 2D poses of shape (batch, frames, joints, 2)
+            
+        Returns:
+            3D poses of shape (batch, frames, joints, 3)
+        """
+        b, f, j, c = x.shape
+        
+        # Embed: (B, T, J, 2) -> (B, T_patches, num_groups, hidden_size)
+        # V2 embedder handles proper patchification with unique projections per (t, g)
+        x = self.embedder(x)
+        x = self.pos_drop(x)
+        x = self.Embedder_norm(x)
+        
+        t = self.num_time_patches
+        n = self.num_groups
+        
+        # Alternating spatial-temporal blocks (all depth blocks in unified loop)
+        for i in range(self.block_depth):
+            # Spatial attention (over body part groups)
+            x = rearrange(x, 'b t n c -> (b t) n c')
+            x = self.STEblocks[i](x)
+            x = self.Spatial_norm(x)
+            
+            # Temporal attention (over time patches)
+            x = rearrange(x, '(b t) n c -> (b n) t c', t=t)
+            x = self.TTEblocks[i](x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) t c -> b t n c', n=n)
+        
+        # Decode: (B, T_patches, num_groups, hidden_size) -> (B, T, J, 3)
+        x = self.decoder(x)
+
+        return x
+
+
+class BiomechMixSTE(MixSTE2):
+    """
+    MixSTE2 with biomechanical constraint support.
+    
+    This model has the same architecture as MixSTE2 but stores skeleton information
+    (parent hierarchy, joint symmetry, angle limits) needed for computing
+    biomechanical losses during training.
+    
+    The biomechanical losses are not computed inside the model - they are computed
+    in the training script using the poses predicted by this model.
+    
+    Args:
+        Same as MixSTE2, plus:
+        skeleton_parents: List of parent joint indices (default: H36M 17-joint)
+        left_joints: List of left-side joint indices for symmetry
+        right_joints: List of right-side joint indices for symmetry
+        angle_limits: Dict mapping joint index to (min_angle, max_angle) in degrees
+    """
+    
+    # Default H36M 17-joint skeleton parents
+    DEFAULT_PARENTS = [-1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 9, 8, 11, 12, 8, 14, 15]
+    
+    # Left/Right joint pairs for symmetry
+    DEFAULT_LEFT_JOINTS = [4, 5, 6, 11, 12, 13]   # Left leg + Left arm
+    DEFAULT_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
+    
+    # Default joint angle limits in degrees [min, max]
+    DEFAULT_ANGLE_LIMITS = {
+        # Knees: angle between thigh and shin (prevent hyperextension)
+        2: (10.0, 170.0),   # Right knee
+        5: (10.0, 170.0),   # Left knee
+        # Elbows: angle between upper arm and forearm
+        12: (10.0, 160.0),  # Left elbow
+        15: (10.0, 160.0),  # Right elbow
+        # Hips: angle between pelvis direction and thigh
+        1: (20.0, 170.0),   # Right hip
+        4: (20.0, 170.0),   # Left hip
+        # Shoulders: angle between spine and upper arm
+        11: (20.0, 180.0),  # Left shoulder
+        14: (20.0, 180.0),  # Right shoulder
+        # Spine/Neck: limited range
+        7: (140.0, 180.0),  # Lower spine
+        8: (140.0, 180.0),  # Upper spine/thorax
+        9: (120.0, 180.0),  # Neck
+        10: (90.0, 180.0),  # Head
+    }
+    
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
+                 skeleton_parents=None, left_joints=None, right_joints=None, angle_limits=None):
+        # Initialize parent class (MixSTE2)
+        super().__init__(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            in_chans=in_chans,
+            embed_dim_ratio=embed_dim_ratio,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+            norm_layer=norm_layer
+        )
+        
+        # Store biomechanical parameters
+        self.skeleton_parents = skeleton_parents if skeleton_parents is not None else self.DEFAULT_PARENTS
+        self.left_joints = left_joints if left_joints is not None else self.DEFAULT_LEFT_JOINTS
+        self.right_joints = right_joints if right_joints is not None else self.DEFAULT_RIGHT_JOINTS
+        self.angle_limits = angle_limits if angle_limits is not None else self.DEFAULT_ANGLE_LIMITS
+    
+    def get_skeleton_info(self):
+        """Return skeleton information for biomechanical loss computation."""
+        return {
+            'parents': self.skeleton_parents,
+            'left_joints': self.left_joints,
+            'right_joints': self.right_joints,
+            'angle_limits': self.angle_limits
+        }
