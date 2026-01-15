@@ -234,30 +234,56 @@ def mean_velocity_error(predicted, target, axis=0):
 #                9-10=Neck/Head, 11-13=LeftArm, 14-16=RightArm
 H36M_PARENTS = [-1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 9, 8, 11, 12, 8, 14, 15]
 
+# Children for each joint (derived from parents)
+# Used for computing joint angles correctly
+H36M_CHILDREN = [
+    [1, 4, 7],  # 0: Pelvis -> RHip, LHip, Spine
+    [2],        # 1: RHip -> RKnee
+    [3],        # 2: RKnee -> RAnkle
+    [],         # 3: RAnkle (leaf)
+    [5],        # 4: LHip -> LKnee
+    [6],        # 5: LKnee -> LAnkle
+    [],         # 6: LAnkle (leaf)
+    [8],        # 7: Spine -> Thorax
+    [9, 11, 14],# 8: Thorax -> Neck, LShoulder, RShoulder
+    [10],       # 9: Neck -> Head
+    [],         # 10: Head (leaf)
+    [12],       # 11: LShoulder -> LElbow
+    [13],       # 12: LElbow -> LWrist
+    [],         # 13: LWrist (leaf)
+    [15],       # 14: RShoulder -> RElbow
+    [16],       # 15: RElbow -> RWrist
+    [],         # 16: RWrist (leaf)
+]
+
 # Left/Right joint pairs for symmetry (child joints)
 H36M_LEFT_JOINTS = [4, 5, 6, 11, 12, 13]   # Left leg (hip, knee, ankle) + Left arm (shoulder, elbow, wrist)
 H36M_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
 
 # Default joint angle limits in degrees [min, max]
-# These are conservative estimates for parent-child bone angles
+# Now correctly indexed: angle AT joint j is the angle formed by bones meeting at j
+# For joint j: angle between (parent->j) and (j->child)
+# Convention: 180° = straight limb, smaller = more bent/flexed
+# We mainly penalize over-flexion (angles too small), not extension
 DEFAULT_ANGLE_LIMITS = {
-    # Knees: angle between thigh and shin (prevent hyperextension)
-    2: (10.0, 170.0),   # Right knee
-    5: (10.0, 170.0),   # Left knee
-    # Elbows: angle between upper arm and forearm
-    12: (10.0, 160.0),  # Left elbow
-    15: (10.0, 160.0),  # Right elbow
-    # Hips: angle between pelvis direction and thigh
-    1: (20.0, 170.0),   # Right hip
-    4: (20.0, 170.0),   # Left hip
-    # Shoulders: angle between spine and upper arm
+    # Knees: prevent over-flexion (fully bent < 30°) 
+    # Normal range: ~30° (deep squat) to 180° (straight)
+    2: (30.0, 180.0),   # Right knee
+    5: (30.0, 180.0),   # Left knee
+    # Elbows: prevent over-flexion
+    # Normal range: ~30° (fully bent) to 180° (straight)  
+    12: (30.0, 180.0),  # Left elbow
+    15: (30.0, 180.0),  # Right elbow
+    # Hips: wide range of motion
+    1: (30.0, 180.0),   # Right hip
+    4: (30.0, 180.0),   # Left hip
+    # Shoulders: very flexible
     11: (20.0, 180.0),  # Left shoulder
     14: (20.0, 180.0),  # Right shoulder
-    # Spine/Neck: limited range
-    7: (140.0, 180.0),  # Lower spine
-    8: (140.0, 180.0),  # Upper spine/thorax
+    # Spine joints: limited flexion
+    7: (140.0, 180.0),  # Spine (Pelvis->Spine->Thorax)
+    8: (120.0, 180.0),  # Thorax
     9: (120.0, 180.0),  # Neck
-    10: (90.0, 180.0),  # Head
 }
 
 
@@ -347,49 +373,68 @@ def compute_bone_lengths(poses, parents):
     return bone_lengths
 
 
-def compute_joint_angles(poses, parents):
+def compute_joint_angles(poses, parents, children=None):
     """
-    Compute joint angles (angle between parent bone and child bone).
+    Compute joint angles - the angle formed AT each joint.
     
-    For joint j with parent p:
-    - Parent bone: vector from grandparent to parent
-    - Child bone: vector from parent to child
-    - Angle: angle between these two vectors
+    For joint j (non-leaf, non-root):
+    - Incoming bone: parent(j) -> j
+    - Outgoing bone: j -> child(j) (uses first child if multiple)
+    - Angle AT joint j = angle between incoming and outgoing bones
+    
+    Example for knee (joint 2):
+    - Incoming: Hip -> Knee (thigh)
+    - Outgoing: Knee -> Ankle (shin)
+    - Angle: the knee flexion angle
     
     Args:
         poses: 3D poses of shape (B, T, J, 3) or (B, J, 3)
         parents: List of parent indices for each joint
+        children: List of children lists for each joint (default: H36M_CHILDREN)
         
     Returns:
         angles: Joint angles in degrees of shape (..., J)
+                Leaf joints and root have angle = 180.0 (undefined/straight)
     """
+    if children is None:
+        children = H36M_CHILDREN
+    
     bone_vectors = compute_bone_vectors(poses, parents)
-    parents_tensor = torch.tensor(parents, device=poses.device, dtype=torch.long)
+    num_joints = len(parents)
     
-    # Get parent bone vectors
-    # For joint j, parent bone is bone_vectors[..., parent[j], :]
-    parent_bone_vectors = bone_vectors[..., parents_tensor, :]
+    # Initialize angles to 180 (straight/undefined for leaves and root)
+    angles_deg = torch.full(poses.shape[:-1], 180.0, device=poses.device, dtype=poses.dtype)
     
-    # Handle root and its immediate children (no grandparent)
-    root_mask = parents_tensor <= 0
-    
-    # Current bone vectors
-    child_bone_vectors = bone_vectors
-    
-    # Normalize vectors
-    parent_norm = parent_bone_vectors / (torch.norm(parent_bone_vectors, dim=-1, keepdim=True) + 1e-8)
-    child_norm = child_bone_vectors / (torch.norm(child_bone_vectors, dim=-1, keepdim=True) + 1e-8)
-    
-    # Compute angle via dot product
-    # Angle = arccos(parent · child)
-    dot_product = torch.sum(parent_norm * child_norm, dim=-1)
-    dot_product = torch.clamp(dot_product, -1.0, 1.0)  # Numerical stability
-    
-    angles_rad = torch.acos(dot_product)
-    angles_deg = angles_rad * 180.0 / np.pi
-    
-    # Set angles for root and its children to 180 (straight) since they have no valid parent bone
-    angles_deg[..., root_mask] = 180.0
+    for j in range(num_joints):
+        # Skip root (no incoming bone) and leaf joints (no outgoing bone)
+        if parents[j] == -1 or len(children[j]) == 0:
+            continue
+        
+        # Incoming bone: parent -> j
+        incoming = bone_vectors[..., j, :]  # shape: (..., 3)
+        
+        # Outgoing bone: j -> first child
+        # Use first child if joint has multiple children
+        first_child = children[j][0]
+        outgoing = bone_vectors[..., first_child, :]  # shape: (..., 3)
+        
+        # Normalize
+        incoming_norm = incoming / (torch.norm(incoming, dim=-1, keepdim=True) + 1e-8)
+        outgoing_norm = outgoing / (torch.norm(outgoing, dim=-1, keepdim=True) + 1e-8)
+        
+        # Vector angle between incoming and outgoing
+        # When bones are parallel (straight limb): dot=1, arccos=0
+        # When bones are opposite (fully bent): dot=-1, arccos=180
+        dot_product = torch.sum(incoming_norm * outgoing_norm, dim=-1)
+        dot_product = torch.clamp(dot_product, -1.0, 1.0)
+        
+        vector_angle_rad = torch.acos(dot_product)
+        vector_angle_deg = vector_angle_rad * 180.0 / np.pi
+        
+        # Convert to anatomical convention:
+        # Straight limb (parallel vectors, 0° vector angle) = 180° anatomical
+        # Fully bent (opposite vectors, 180° vector angle) = 0° anatomical
+        angles_deg[..., j] = 180.0 - vector_angle_deg
     
     return angles_deg
 
