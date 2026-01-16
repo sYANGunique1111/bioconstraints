@@ -55,12 +55,14 @@ def parse_args():
     parser.add_argument('--nolog', action='store_true')
     
     # Biomechanical loss weights (for main_biomech.py)
-    parser.add_argument('--weight_bone', default=0.1, type=float, 
-                        help='Weight for bone length consistency loss')
-    parser.add_argument('--weight_symmetry', default=0.05, type=float,
+    # Note: Bone/symmetry losses are MSE in meters (~0.0001), while angle loss is MSE in degrees (~25)
+    # Weights are adjusted so all losses contribute roughly equally to gradients
+    parser.add_argument('--weight_bone', default=100.0, type=float, 
+                        help='Weight for bone length consistency loss (high due to meter-scale MSE)')
+    parser.add_argument('--weight_symmetry', default=50.0, type=float,
                         help='Weight for left/right symmetry loss')
-    parser.add_argument('--weight_angle', default=0.01, type=float,
-                        help='Weight for joint angle limit loss')
+    parser.add_argument('--weight_angle', default=0.001, type=float,
+                        help='Weight for joint angle limit loss (low to avoid dominating MPJPE)')
     
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
 

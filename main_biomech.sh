@@ -29,10 +29,12 @@ args=(
     "--attn_drop_rate" "0.0"
     "--drop_path_rate" "0.0"
     
-    # Biomechanical loss weights
-    "--weight_bone" "0.1"        # Bone length consistency
-    "--weight_symmetry" "0.05"   # Left/right symmetry
-    "--weight_angle" "0.01"      # Joint angle limits
+    # Biomechanical loss weights (balanced for unit scales)
+    # Bone/symmetry: MSE in meters (~0.0001) needs high weight to matter
+    # Angle: MSE in degrees (~25) needs low weight to not dominate
+    "--weight_bone" "100.0"
+    "--weight_symmetry" "50.0"
+    "--weight_angle" "0.001"
     
     # Checkpoint settings
     "--checkpoint" "checkpoint/biomech_mixste_cpn_h36m"
@@ -45,7 +47,7 @@ args=(
     
     # Other options
     "--nolog"
-    # "--wandb"  # Uncomment to enable W&B logging
+    "--wandb"  # Uncomment to enable W&B logging
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL

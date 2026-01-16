@@ -1,0 +1,1 @@
+{"_timestamp":1.7685590364773812e+09,"train_loss":NaN,"_step":0,"biomech/joint_angle":NaN,"_wandb":{"runtime":1471},"biomech/symmetry":NaN,"_runtime":1471,"valid_loss":NaN,"time_per_epoch":23.221718009312948,"train_mpjpe":NaN,"learning_rate":4e-05,"best_valid_loss":100000,"biomech/bone_length":NaN,"epoch":1}

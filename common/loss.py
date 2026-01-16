@@ -426,7 +426,12 @@ def compute_joint_angles(poses, parents, children=None):
         # When bones are parallel (straight limb): dot=1, arccos=0
         # When bones are opposite (fully bent): dot=-1, arccos=180
         dot_product = torch.sum(incoming_norm * outgoing_norm, dim=-1)
-        dot_product = torch.clamp(dot_product, -1.0, 1.0)
+        
+        # CRITICAL: Use epsilon to avoid infinite gradient at arccos boundaries
+        # d/dx arccos(x) = -1/sqrt(1-x²) → ∞ as x → ±1
+        # Straight limbs (common state) push dot_product to 1.0, causing explosion
+        eps = 1e-6
+        dot_product = torch.clamp(dot_product, -1.0 + eps, 1.0 - eps)
         
         vector_angle_rad = torch.acos(dot_product)
         vector_angle_deg = vector_angle_rad * 180.0 / np.pi

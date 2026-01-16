@@ -911,24 +911,24 @@ class BiomechMixSTE(MixSTE2):
     DEFAULT_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
     
     # Default joint angle limits in degrees [min, max]
+    # Convention: 180° = straight limb, smaller = more bent/flexed
     DEFAULT_ANGLE_LIMITS = {
-        # Knees: angle between thigh and shin (prevent hyperextension)
-        2: (10.0, 170.0),   # Right knee
-        5: (10.0, 170.0),   # Left knee
-        # Elbows: angle between upper arm and forearm
-        12: (10.0, 160.0),  # Left elbow
-        15: (10.0, 160.0),  # Right elbow
-        # Hips: angle between pelvis direction and thigh
-        1: (20.0, 170.0),   # Right hip
-        4: (20.0, 170.0),   # Left hip
-        # Shoulders: angle between spine and upper arm
+        # Knees: prevent over-flexion (30° min allows deep squat)
+        2: (30.0, 180.0),   # Right knee
+        5: (30.0, 180.0),   # Left knee
+        # Elbows: prevent over-flexion
+        12: (30.0, 180.0),  # Left elbow
+        15: (30.0, 180.0),  # Right elbow
+        # Hips: wide range of motion
+        1: (30.0, 180.0),   # Right hip
+        4: (30.0, 180.0),   # Left hip
+        # Shoulders: very flexible
         11: (20.0, 180.0),  # Left shoulder
         14: (20.0, 180.0),  # Right shoulder
-        # Spine/Neck: limited range
+        # Spine joints: limited flexion
         7: (140.0, 180.0),  # Lower spine
-        8: (140.0, 180.0),  # Upper spine/thorax
+        8: (120.0, 180.0),  # Upper spine/thorax
         9: (120.0, 180.0),  # Neck
-        10: (90.0, 180.0),  # Head
     }
     
     def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,

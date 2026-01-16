@@ -250,6 +250,9 @@ def runner(rank, args, train_data, test_data):
             # Total loss
             loss = loss_mpjpe + loss_biomech
             loss.backward()
+            
+            # Gradient clipping to prevent explosion from biomechanical loss
+            torch.nn.utils.clip_grad_norm_(model_pos.parameters(), max_norm=1.0)
 
             batch_size = inputs_3d.shape[0] * inputs_3d.shape[1]
             epoch_loss_train += batch_size * loss.item()
@@ -327,8 +330,13 @@ def runner(rank, args, train_data, test_data):
                 if epoch in gradient_epochs:
                     for name, param in model_pos.named_parameters():
                         if param.grad is not None:
-                            log_dict[f"gradients/{name}"] = wandb.Histogram(param.grad.cpu().numpy())
-                            log_dict[f"params/{name}"] = wandb.Histogram(param.data.cpu().numpy())
+                            grad_np = param.grad.cpu().numpy()
+                            param_np = param.data.cpu().numpy()
+                            # Skip if gradients contain NaN (can happen with arccos edge cases)
+                            if not np.isnan(grad_np).any():
+                                log_dict[f"gradients/{name}"] = wandb.Histogram(grad_np)
+                            if not np.isnan(param_np).any():
+                                log_dict[f"params/{name}"] = wandb.Histogram(param_np)
                 
                 wandb.log(log_dict)
 
