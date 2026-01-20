@@ -24,7 +24,7 @@ from common.arguments import parse_args
 from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
 from common.loss import mpjpe, p_mpjpe
-from models.mixste import MixSTE2, HybridMixSTE, HybridMixSTEV2
+from models.mixste import MixSTE2, HybridMixSTE, HybridMixSTEV2, HybridMixSTEWithJointConv
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
 
 # Global args (set in main)
@@ -302,6 +302,18 @@ def runner(rank, args, train_data, test_data):
             joint_groups=joint_groups,
             decoder_mode=getattr(args, 'decoder_mode', 'overlap_average')
         ).cuda()
+    elif args.model == 'hybrid_joint_conv':
+        model_pos = HybridMixSTEWithJointConv(
+            num_frame=args.number_of_frames,
+            num_joints=args.num_joints,
+            in_chans=2,
+            embed_dim_ratio=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            drop_rate=args.drop_rate,
+            patch_size=args.patch_size
+        ).cuda()
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -312,6 +324,7 @@ def runner(rank, args, train_data, test_data):
     min_loss = args.min_loss
     losses_train = []
     losses_valid = []
+    losses_p_valid = []
 
     epoch = 0
     
@@ -392,6 +405,7 @@ def runner(rank, args, train_data, test_data):
         with torch.no_grad():
             model_pos.eval()
             epoch_loss_valid = 0
+            epoch_loss_p_mpjpe = 0
             N_valid = 0
 
             for _, inputs_3d, inputs_2d in valid_loader:
@@ -400,22 +414,30 @@ def runner(rank, args, train_data, test_data):
                 inputs_3d[:, :, 0] = 0
 
                 predicted_3d = model_pos(inputs_2d)
+                predicted_3d[:, :, 0] = 0
+                
                 error = mpjpe(predicted_3d, inputs_3d)
+                p_error = torch.tensor(p_mpjpe(predicted_3d.cpu().numpy(), inputs_3d.cpu().numpy())).cuda()
                 
                 dist.all_reduce(error, op=dist.ReduceOp.SUM)
-                epoch_loss_valid += inputs_3d.shape[0] * inputs_3d.shape[1] * error.cpu().item() / args.world_size
-                N_valid += inputs_3d.shape[0] * inputs_3d.shape[1]
+                dist.all_reduce(p_error, op=dist.ReduceOp.SUM)
+                
+                batch_size = inputs_3d.shape[0] * inputs_3d.shape[1]
+                epoch_loss_valid += batch_size * error.cpu().item() / args.world_size
+                epoch_loss_p_mpjpe += batch_size * p_error.cpu().item() / args.world_size
+                N_valid += batch_size
 
             losses_valid.append(epoch_loss_valid / N_valid)
+            losses_p_valid.append(epoch_loss_p_mpjpe / N_valid)
 
         elapsed = (time.time() - start_time) / 60
         
         if dist.get_rank() == args.reduce_rank:
-            print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} train {losses_train[-1]*1000:.3f}mm valid {losses_valid[-1]*1000:.3f}mm')
+            print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} train {losses_train[-1]*1000:.3f}mm valid {losses_valid[-1]*1000:.3f}mm PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm')
 
             log_path = os.path.join(args.checkpoint, 'training_log.txt')
             with open(log_path, mode='a') as f:
-                f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} train {losses_train[-1]*1000:.3f} valid {losses_valid[-1]*1000:.3f}\n')
+                f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} train {losses_train[-1]*1000:.3f} valid {losses_valid[-1]*1000:.3f} PA-MPJPE {losses_p_valid[-1]*1000:.3f}\n')
             
             # W&B logging
             if args.wandb:
@@ -424,6 +446,7 @@ def runner(rank, args, train_data, test_data):
                     "epoch": epoch + 1,
                     "train_loss": losses_train[-1] * 1000,
                     "valid_loss": losses_valid[-1] * 1000,
+                    "valid_p_mpjpe": losses_p_valid[-1] * 1000,
                     "learning_rate": lr,
                     "best_valid_loss": min_loss,
                     "time_per_epoch": elapsed

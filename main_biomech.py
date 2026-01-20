@@ -156,6 +156,7 @@ def runner(rank, args, train_data, test_data):
     min_loss = args.min_loss
     losses_train = []
     losses_valid = []
+    losses_p_valid = []
     
     # Biomechanical loss tracking
     biomech_losses_train = {'bone_length': [], 'symmetry': [], 'joint_angle': []}
@@ -274,6 +275,7 @@ def runner(rank, args, train_data, test_data):
         with torch.no_grad():
             model_pos.eval()
             epoch_loss_valid = 0
+            epoch_loss_p_mpjpe = 0
             N_valid = 0
 
             for _, inputs_3d, inputs_2d in valid_loader:
@@ -284,13 +286,21 @@ def runner(rank, args, train_data, test_data):
                 inputs_3d[:, :, 0] = 0
 
                 predicted_3d = model_pos(inputs_2d)
+                predicted_3d[:, :, 0] = 0
+
                 error = mpjpe(predicted_3d, inputs_3d)
+                p_error = torch.tensor(p_mpjpe(predicted_3d.cpu().numpy(), inputs_3d.cpu().numpy())).cuda()
                 
                 dist.all_reduce(error, op=dist.ReduceOp.SUM)
-                epoch_loss_valid += inputs_3d.shape[0] * inputs_3d.shape[1] * error.cpu().item() / args.world_size
-                N_valid += inputs_3d.shape[0] * inputs_3d.shape[1]
+                dist.all_reduce(p_error, op=dist.ReduceOp.SUM)
+                
+                batch_size = inputs_3d.shape[0] * inputs_3d.shape[1]
+                epoch_loss_valid += batch_size * error.cpu().item() / args.world_size
+                epoch_loss_p_mpjpe += batch_size * p_error.cpu().item() / args.world_size
+                N_valid += batch_size
 
             losses_valid.append(epoch_loss_valid / N_valid)
+            losses_p_valid.append(epoch_loss_p_mpjpe / N_valid)
 
         elapsed = (time.time() - start_time) / 60
         
@@ -298,6 +308,7 @@ def runner(rank, args, train_data, test_data):
             print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} '
                   f'train {losses_train[-1]*1000:.3f}mm (mpjpe {epoch_loss_mpjpe/N*1000:.3f}) '
                   f'valid {losses_valid[-1]*1000:.3f}mm '
+                  f'PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm '
                   f'bone {biomech_losses_train["bone_length"][-1]:.6f} '
                   f'sym {biomech_losses_train["symmetry"][-1]:.6f} '
                   f'angle {biomech_losses_train["joint_angle"][-1]:.4f}')
@@ -307,6 +318,7 @@ def runner(rank, args, train_data, test_data):
                 f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} '
                        f'train {losses_train[-1]*1000:.3f} '
                        f'valid {losses_valid[-1]*1000:.3f} '
+                       f'PA-MPJPE {losses_p_valid[-1]*1000:.3f} '
                        f'bone {biomech_losses_train["bone_length"][-1]:.6f} '
                        f'sym {biomech_losses_train["symmetry"][-1]:.6f} '
                        f'angle {biomech_losses_train["joint_angle"][-1]:.4f}\n')
@@ -319,6 +331,7 @@ def runner(rank, args, train_data, test_data):
                     "train_loss": losses_train[-1] * 1000,
                     "train_mpjpe": epoch_loss_mpjpe / N * 1000,
                     "valid_loss": losses_valid[-1] * 1000,
+                    "valid_p_mpjpe": losses_p_valid[-1] * 1000,
                     "learning_rate": lr,
                     "best_valid_loss": min_loss,
                     "time_per_epoch": elapsed,

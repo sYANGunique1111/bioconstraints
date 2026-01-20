@@ -8,7 +8,7 @@ KEYPOINTS="cpn_ft_h36m_dbb"
 # KEYPOINTS="gt"
 
 # Model selection: "mixste" or "hybrid"
-MODEL="hybrid_mixste"
+MODEL="hybrid_joint_conv"
 
 args=(
     # Training settings
@@ -39,7 +39,7 @@ args=(
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings
-    "--checkpoint" "checkpoint/hybrid_mixste-patch9-single-group_h36m_group_layer_norm"
+    "--checkpoint" "checkpoint/HybridMixSTEWithJointConv-HybridSpatialBlockV-GroupDecoderV2_alpha-patch9-5semantic-group"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"
@@ -52,6 +52,7 @@ args=(
     
     # Other options
     "--nolog"
+    "--wandb"  # Uncomment to enable W&B logging
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL

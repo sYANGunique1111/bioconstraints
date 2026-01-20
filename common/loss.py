@@ -85,6 +85,11 @@ def p_mpjpe(predicted, target):
     """
     assert predicted.shape == target.shape
     
+    if len(predicted.shape) == 4:
+        # Reshape (B, T, J, C) -> (B*T, J, C) for frame-wise alignment
+        predicted = predicted.reshape(-1, predicted.shape[2], predicted.shape[3])
+        target = target.reshape(-1, target.shape[2], target.shape[3])
+
     muX = np.mean(target, axis=1, keepdims=True)
     muY = np.mean(predicted, axis=1, keepdims=True)
     
