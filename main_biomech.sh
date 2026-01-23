@@ -34,14 +34,15 @@ args=(
     # Angle: MSE in degrees (~25) needs low weight to not dominate
     "--weight_bone" "100.0"
     "--weight_symmetry" "50.0"
-    "--weight_angle" "0.001"
+    "--weight_angle" "0.0"
+    
     
     # Checkpoint settings
-    "--checkpoint" "checkpoint/biomech_mixste_cpn_h36m"
+    "--checkpoint" "checkpoint/biomech_mixste_cpn_h36m_100-50-0"
     
     # DDP settings
-    "--world_size" "2" 
-    "--master_port" "8501" 
+    "--world_size" "1" 
+    "--master_port" "8502" 
     "--master_addr" "127.0.0.1" 
     "--reduce_rank" "0"
     
@@ -51,4 +52,4 @@ args=(
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-CUDA_VISIBLE_DEVICES="0,1" python main_biomech.py ${args[@]}
+CUDA_VISIBLE_DEVICES="0" python main_biomech.py ${args[@]}

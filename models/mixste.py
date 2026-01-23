@@ -651,18 +651,23 @@ class HybridJointSemanticEmbedder(nn.Module):
         
         self.num_time_patches = num_frame // patch_size
         
-        # ===== Joint Groups Module (2D Conv) =====
-        # 2D conv with kernel (p, 1): p along temporal (T), 1 along spatial (J)
-        # Conv2d operates on (B, C, height, width) where height=T, width=J
-        # Input: (B, C, T, J) -> Output: (B, hidden_size, T//p, J)
-        self.joint_conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=hidden_size,  # Directly output to hidden_size
-            kernel_size=(patch_size, 1),  # (temporal=p, spatial=1)
-            stride=(patch_size, 1),        # No overlap
-            padding=0,
-            bias=bias
-        )
+        # ===== Joint Groups Module (2D Conv or Linear) =====
+        self.use_linear_joint = (patch_size == 1)
+        if self.use_linear_joint:
+            # Use Linear (equivalent to 1x1 conv) for efficiency and to avoid DDP stride warnings
+            self.joint_conv = nn.Linear(in_channels, hidden_size, bias=bias)
+        else:
+            # 2D conv with kernel (p, 1): p along temporal (T), 1 along spatial (J)
+            # Conv2d operates on (B, C, height, width) where height=T, width=J
+            # Input: (B, C, T, J) -> Output: (B, hidden_size, T//p, J)
+            self.joint_conv = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=hidden_size,  # Directly output to hidden_size
+                kernel_size=(patch_size, 1),  # (temporal=p, spatial=1)
+                stride=(patch_size, 1),        # No overlap
+                padding=0,
+                bias=bias
+            )
         
         # Positional embeddings
         # Temporal PE: shared by both joint and semantic groups (same temporal division)
@@ -698,7 +703,7 @@ class HybridJointSemanticEmbedder(nn.Module):
     
     def _process_joint_groups(self, x):
         """
-        Process input through joint groups pathway using 2D conv.
+        Process input through joint groups pathway.
         
         Args:
             x: (B, T, J, C) - 2D poses
@@ -706,16 +711,21 @@ class HybridJointSemanticEmbedder(nn.Module):
         Returns:
             joint_tokens: (B, T_patches, J, hidden_size)
         """
-        B, T, J, C = x.shape
-        
-        # Convert to (B, C, T, J) for 2D conv (treating as "pose image")
-        x_conv = x.permute(0, 3, 1, 2)  # (B, C, T, J)
-        
-        # Apply 2D conv: (B, C, T, J) -> (B, hidden_size, T//p, J)
-        conv_out = self.joint_conv(x_conv)  # (B, hidden_size, T_patches, J)
-        
-        # Rearrange to (B, T_patches, J, hidden_size)
-        joint_tokens = conv_out.permute(0, 2, 3, 1)  # (B, T_patches, J, hidden_size)
+        if self.use_linear_joint:
+            # Linear projection: (B, T, J, C) -> (B, T, J, hidden_size)
+            # T_patches == T when patch_size == 1
+            joint_tokens = self.joint_conv(x) 
+        else:
+            B, T, J, C = x.shape
+            
+            # Convert to (B, C, T, J) for 2D conv (treating as "pose image")
+            x_conv = x.permute(0, 3, 1, 2)  # (B, C, T, J)
+            
+            # Apply 2D conv: (B, C, T, J) -> (B, hidden_size, T//p, J)
+            conv_out = self.joint_conv(x_conv)  # (B, hidden_size, T_patches, J)
+            
+            # Rearrange to (B, T_patches, J, hidden_size)
+            joint_tokens = conv_out.permute(0, 2, 3, 1)  # (B, T_patches, J, hidden_size)
         
         # Add positional embeddings
         # Temporal PE: broadcast across joints (dim 2)
@@ -1244,7 +1254,7 @@ class DualGroupDecoderV2(nn.Module):
         
         # Learnable combination weight (initialized to init_weight)
         # final = alpha * joint + (1 - alpha) * semantic
-        self.alpha = nn.Parameter(torch.tensor(init_weight), requires_grad=True)
+        self.alpha = nn.Parameter(torch.tensor(init_weight), requires_grad=False)
     
     def forward(self, tokens):
         """

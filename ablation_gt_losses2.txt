@@ -1,0 +1,89 @@
+GT Ablation Study: Biomechanical Losses on H36M
+==================================================
+
+Subjects: S1, S5, S6, S7, S8, S9, S11
+Total frames: 2103096
+
+Per-Action Breakdown:
+--------------------------------------------------
+
+Action: Directions
+  Frames: 127364
+  Symmetry Loss:  mean=0.00000150, std=0.00000089
+  Angle Loss:     mean=0.00000070, std=0.00004160
+
+Action: Discussion
+  Frames: 223032
+  Symmetry Loss:  mean=0.00000154, std=0.00000097
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Eating
+  Frames: 148732
+  Symmetry Loss:  mean=0.00000157, std=0.00000094
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Greeting
+  Frames: 103080
+  Symmetry Loss:  mean=0.00000147, std=0.00000088
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Phoning
+  Frames: 171920
+  Symmetry Loss:  mean=0.00000152, std=0.00000091
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Photo
+  Frames: 105368
+  Symmetry Loss:  mean=0.00000141, std=0.00000085
+  Angle Loss:     mean=0.00010070, std=0.00123933
+
+Action: Posing
+  Frames: 96748
+  Symmetry Loss:  mean=0.00000149, std=0.00000090
+  Angle Loss:     mean=0.00000008, std=0.00000722
+
+Action: Purchases
+  Frames: 82364
+  Symmetry Loss:  mean=0.00000143, std=0.00000089
+  Angle Loss:     mean=0.00000707, std=0.00014908
+
+Action: Sitting
+  Frames: 156748
+  Symmetry Loss:  mean=0.00000158, std=0.00000097
+  Angle Loss:     mean=0.00005503, std=0.00087007
+
+Action: SittingDown
+  Frames: 162556
+  Symmetry Loss:  mean=0.00000170, std=0.00000096
+  Angle Loss:     mean=0.00004635, std=0.00079859
+
+Action: Smoking
+  Frames: 188804
+  Symmetry Loss:  mean=0.00000153, std=0.00000092
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Waiting
+  Frames: 153160
+  Symmetry Loss:  mean=0.00000151, std=0.00000089
+  Angle Loss:     mean=0.00000064, std=0.00002768
+
+Action: WalkDog
+  Frames: 107716
+  Symmetry Loss:  mean=0.00000160, std=0.00000094
+  Angle Loss:     mean=0.00004583, std=0.00090294
+
+Action: WalkTogether
+  Frames: 113496
+  Symmetry Loss:  mean=0.00000147, std=0.00000088
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+Action: Walking
+  Frames: 162008
+  Symmetry Loss:  mean=0.00000168, std=0.00000095
+  Angle Loss:     mean=0.00000000, std=0.00000000
+
+
+Overall Dataset:
+--------------------------------------------------
+  Symmetry Loss:  mean=0.00000154, std=0.00000093
+  Angle Loss:     mean=0.00001545, std=0.00047564

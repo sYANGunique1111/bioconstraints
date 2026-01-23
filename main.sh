@@ -31,7 +31,7 @@ args=(
     "--num_joints" "17"
     
     # HybridPoseModel specific
-    "--patch_size" "9"
+    "--patch_size" "1"
     
     # Dropout settings
     "--drop_rate" "0.0"
@@ -39,7 +39,7 @@ args=(
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings
-    "--checkpoint" "checkpoint/HybridMixSTEWithJointConv-HybridSpatialBlockV-GroupDecoderV2_alpha-patch9-5semantic-group"
+    "--checkpoint" "checkpoint/HybridMixSTEWithJointConv-HybridSpatialBlockV-GroupDecoderV2-patch1-5semantic-group"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"
@@ -56,4 +56,4 @@ args=(
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-CUDA_VISIBLE_DEVICES="0" python main.py ${args[@]}
+CUDA_VISIBLE_DEVICES="1" python main.py ${args[@]}

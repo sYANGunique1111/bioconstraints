@@ -265,30 +265,33 @@ H36M_CHILDREN = [
 H36M_LEFT_JOINTS = [4, 5, 6, 11, 12, 13]   # Left leg (hip, knee, ankle) + Left arm (shoulder, elbow, wrist)
 H36M_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
 
-# Default joint angle limits in degrees [min, max]
+# Default joint angle limits in RADIANS [min, max]
 # Now correctly indexed: angle AT joint j is the angle formed by bones meeting at j
 # For joint j: angle between (parent->j) and (j->child)
-# Convention: 180° = straight limb, smaller = more bent/flexed
-# We mainly penalize over-flexion (angles too small), not extension
+# Convention: π = straight limb, smaller = more bent/flexed
+# Limits adjusted based on GT analysis to be more permissive
 DEFAULT_ANGLE_LIMITS = {
-    # Knees: prevent over-flexion (fully bent < 30°) 
-    # Normal range: ~30° (deep squat) to 180° (straight)
-    2: (30.0, 180.0),   # Right knee
-    5: (30.0, 180.0),   # Left knee
-    # Elbows: prevent over-flexion
-    # Normal range: ~30° (fully bent) to 180° (straight)  
-    12: (30.0, 180.0),  # Left elbow
-    15: (30.0, 180.0),  # Right elbow
-    # Hips: wide range of motion
-    1: (30.0, 180.0),   # Right hip
-    4: (30.0, 180.0),   # Left hip
+    # Knees: allow deep flexion for sitting actions
+    # Range: ~15° (0.26 rad) to 180° (π rad)
+    2: (0.26, np.pi),   # Right knee
+    5: (0.26, np.pi),   # Left knee
+    # Elbows: allow full flexion
+    # Range: ~15° (0.26 rad) to 180° (π rad)  
+    12: (0.26, np.pi),  # Left elbow
+    15: (0.26, np.pi),  # Right elbow
+    # Hips: very wide range for sitting/squatting
+    # Range: ~10° (0.17 rad) to 180° (π rad)
+    1: (0.17, np.pi),   # Right hip
+    4: (0.17, np.pi),   # Left hip
     # Shoulders: very flexible
-    11: (20.0, 180.0),  # Left shoulder
-    14: (20.0, 180.0),  # Right shoulder
+    # Range: ~15° (0.26 rad) to 180° (π rad)
+    11: (0.26, np.pi),  # Left shoulder
+    14: (0.26, np.pi),  # Right shoulder
     # Spine joints: limited flexion
-    7: (140.0, 180.0),  # Spine (Pelvis->Spine->Thorax)
-    8: (120.0, 180.0),  # Thorax
-    9: (120.0, 180.0),  # Neck
+    # Range: ~90° (π/2 rad) to 180° (π rad)
+    7: (np.pi / 2, np.pi),  # Spine (Pelvis->Spine->Thorax)
+    8: (np.pi / 3, np.pi),  # Thorax (~60° min)
+    9: (np.pi / 3, np.pi),  # Neck (~60° min)
 }
 
 
@@ -398,8 +401,8 @@ def compute_joint_angles(poses, parents, children=None):
         children: List of children lists for each joint (default: H36M_CHILDREN)
         
     Returns:
-        angles: Joint angles in degrees of shape (..., J)
-                Leaf joints and root have angle = 180.0 (undefined/straight)
+        angles: Joint angles in RADIANS of shape (..., J)
+                Leaf joints and root have angle = π (undefined/straight)
     """
     if children is None:
         children = H36M_CHILDREN
@@ -407,8 +410,8 @@ def compute_joint_angles(poses, parents, children=None):
     bone_vectors = compute_bone_vectors(poses, parents)
     num_joints = len(parents)
     
-    # Initialize angles to 180 (straight/undefined for leaves and root)
-    angles_deg = torch.full(poses.shape[:-1], 180.0, device=poses.device, dtype=poses.dtype)
+    # Initialize angles to π (straight/undefined for leaves and root)
+    angles_rad = torch.full(poses.shape[:-1], np.pi, device=poses.device, dtype=poses.dtype)
     
     for j in range(num_joints):
         # Skip root (no incoming bone) and leaf joints (no outgoing bone)
@@ -429,7 +432,7 @@ def compute_joint_angles(poses, parents, children=None):
         
         # Vector angle between incoming and outgoing
         # When bones are parallel (straight limb): dot=1, arccos=0
-        # When bones are opposite (fully bent): dot=-1, arccos=180
+        # When bones are opposite (fully bent): dot=-1, arccos=π
         dot_product = torch.sum(incoming_norm * outgoing_norm, dim=-1)
         
         # CRITICAL: Use epsilon to avoid infinite gradient at arccos boundaries
@@ -439,19 +442,18 @@ def compute_joint_angles(poses, parents, children=None):
         dot_product = torch.clamp(dot_product, -1.0 + eps, 1.0 - eps)
         
         vector_angle_rad = torch.acos(dot_product)
-        vector_angle_deg = vector_angle_rad * 180.0 / np.pi
         
         # Convert to anatomical convention:
-        # Straight limb (parallel vectors, 0° vector angle) = 180° anatomical
-        # Fully bent (opposite vectors, 180° vector angle) = 0° anatomical
-        angles_deg[..., j] = 180.0 - vector_angle_deg
+        # Straight limb (parallel vectors, 0 rad vector angle) = π anatomical
+        # Fully bent (opposite vectors, π rad vector angle) = 0 anatomical
+        angles_rad[..., j] = np.pi - vector_angle_rad
     
-    return angles_deg
+    return angles_rad
 
 
 def bone_length_loss(predicted, target, parents=None):
     """
-    Compute bone length consistency loss.
+    Compute bone length consistency loss using L1 (absolute difference).
     Penalizes differences in bone lengths between predicted and ground truth poses.
     
     Args:
@@ -460,7 +462,7 @@ def bone_length_loss(predicted, target, parents=None):
         parents: List of parent indices (default: H36M_PARENTS)
         
     Returns:
-        Scalar loss value (mean squared error of bone lengths)
+        Scalar loss value (mean absolute error of bone lengths)
     """
     if parents is None:
         parents = H36M_PARENTS
@@ -468,15 +470,15 @@ def bone_length_loss(predicted, target, parents=None):
     pred_lengths = compute_bone_lengths(predicted, parents)
     gt_lengths = compute_bone_lengths(target, parents)
     
-    # Skip root joint (bone length is 0)
-    loss = torch.mean((pred_lengths[..., 1:] - gt_lengths[..., 1:]) ** 2)
+    # Skip root joint (bone length is 0), use L1 loss
+    loss = torch.mean(torch.abs(pred_lengths[..., 1:] - gt_lengths[..., 1:]))
     
     return loss
 
 
 def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
     """
-    Compute symmetry loss.
+    Compute symmetry loss using L1 (absolute difference).
     Penalizes differences in bone lengths between left and right limbs.
     
     Args:
@@ -486,7 +488,7 @@ def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
         right_joints: List of right-side joint indices (default: H36M_RIGHT_JOINTS)
         
     Returns:
-        Scalar loss value (mean squared error between left/right bone lengths)
+        Scalar loss value (mean absolute error between left/right bone lengths)
     """
     if parents is None:
         parents = H36M_PARENTS
@@ -501,25 +503,25 @@ def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
     left_lengths = pred_lengths[..., left_joints]
     right_lengths = pred_lengths[..., right_joints]
     
-    # Symmetry loss: left and right should have same lengths
-    loss = torch.mean((left_lengths - right_lengths) ** 2)
+    # Symmetry loss: left and right should have same lengths, use L1 loss
+    loss = torch.mean(torch.abs(left_lengths - right_lengths))
     
     return loss
 
 
 def joint_angle_loss(predicted, parents=None, angle_limits=None):
     """
-    Compute joint angle limit loss.
+    Compute joint angle limit loss using L1 penalty in radians.
     Penalizes joint angles outside anatomically plausible ranges.
     
     Args:
         predicted: Predicted 3D poses of shape (B, T, J, 3)
         parents: List of parent indices (default: H36M_PARENTS)
-        angle_limits: Dict mapping joint index to (min_angle, max_angle) in degrees
+        angle_limits: Dict mapping joint index to (min_angle, max_angle) in RADIANS
                       (default: DEFAULT_ANGLE_LIMITS)
         
     Returns:
-        Scalar loss value (penalty for angles outside limits)
+        Scalar loss value (penalty for angles outside limits, in radians)
     """
     if parents is None:
         parents = H36M_PARENTS
@@ -534,14 +536,14 @@ def joint_angle_loss(predicted, parents=None, angle_limits=None):
     for joint_idx, (min_angle, max_angle) in angle_limits.items():
         joint_angles = angles[..., joint_idx]
         
-        # Penalty for angles below minimum (hyperextension)
+        # Penalty for angles below minimum (over-flexion)
         below_min = torch.relu(min_angle - joint_angles)
         
         # Penalty for angles above maximum
         above_max = torch.relu(joint_angles - max_angle)
         
-        # Quadratic penalty
-        total_loss = total_loss + torch.mean(below_min ** 2 + above_max ** 2)
+        # L1 penalty (in radians, comparable scale to MPJPE in meters)
+        total_loss = total_loss + torch.mean(below_min + above_max)
         num_constrained += 1
     
     if num_constrained > 0:
