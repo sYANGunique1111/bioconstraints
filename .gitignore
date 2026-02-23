@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 
 # Checkpoints (ignore contents, keep folder visible to IDE)
+checkpoints/*
 checkpoint/*
 !checkpoint/.gitkeep
 

@@ -503,7 +503,7 @@ def runner(rank, args, train_data, test_data):
 
 def main(args):
     print('Loading dataset...')
-    dataset_root = '/data/shuoyang67/H36m/annot'
+    dataset_root = '/FARM/syangb/data/h36m'
     
     # Dataset path configuration
     dataset_path = f'{dataset_root}/data_3d_{args.dataset}.npz'
