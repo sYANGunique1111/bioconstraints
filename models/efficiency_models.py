@@ -596,6 +596,365 @@ class TwoStageGroupedPoseModel(nn.Module):
 
 
 # =============================================================================
+# Temporal Patchification Modules
+# =============================================================================
+
+class TemporalPatchify(nn.Module):
+    """
+    Temporal Patchification module that groups consecutive frames into patches.
+    
+    Uses a single shared linear projection:
+    (B, J, P, patch_size*C) -> Linear(patch_size*C, C) -> (B, J, P, C)
+    
+    Input: (B, T, J, C)
+    Output: (B, P, J, C) where P = T // patch_size
+    """
+    def __init__(self, num_frame=243, num_joints=17, hidden_size=256, 
+                 patch_size=9, bias=True):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.hidden_size = hidden_size
+        self.patch_size = patch_size
+        
+        # Number of temporal patches
+        self.num_patches = num_frame // patch_size
+        
+        # Input dimension per patch: patch_size * hidden_size
+        self.patch_dim = patch_size * hidden_size
+        
+        # Single shared linear projection: patch_dim -> hidden_size
+        self.proj = nn.Linear(self.patch_dim, hidden_size, bias=bias)
+        
+        # Learnable temporal positional embeddings for patches
+        self.temporal_pe = nn.Parameter(
+            torch.zeros(1, self.num_patches, hidden_size)
+        )
+        trunc_normal_(self.temporal_pe, std=.02)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, J, C) - features after Stage 1
+            
+        Returns:
+            patched: (B, P, J, C) - patchified with temporal PE
+        """
+        B, T, J, C = x.shape
+        P = self.num_patches
+        
+        # Reshape to patches: (B, T, J, C) -> (B, P, patch_size, J, C)
+        x = x.view(B, P, self.patch_size, J, C)
+        
+        # Rearrange: (B, P, patch_size, J, C) -> (B, J, P, patch_size, C)
+        x = x.permute(0, 3, 1, 2, 4)
+        
+        # Flatten patch: (B, J, P, patch_size, C) -> (B, J, P, patch_size*C)
+        x = x.reshape(B, J, P, self.patch_dim)
+        
+        # Single shared projection: (B, J, P, patch_dim) -> (B, J, P, C)
+        x = self.proj(x)
+        
+        # Rearrange to (B, P, J, C) for temporal attention
+        x = x.permute(0, 2, 1, 3)
+        
+        # Add temporal positional embeddings: (1, P, 1, C)
+        x = x + self.temporal_pe.unsqueeze(2)
+        
+        return x
+
+
+class TemporalUpSample(nn.Module):
+    """
+    Temporal UpSample module that expands patches back to original temporal dimension.
+    
+    Uses a single shared linear projection:
+    (B, J, P, C) -> Linear(C, patch_size*C) -> (B, J, P, patch_size*C)
+    
+    Input: (B, P, J, C)
+    Output: (B, T, J, C) where T = P * patch_size
+    """
+    def __init__(self, num_patches, num_joints=17, hidden_size=256, 
+                 patch_size=9, bias=True):
+        super().__init__()
+        self.num_patches = num_patches
+        self.num_joints = num_joints
+        self.hidden_size = hidden_size
+        self.patch_size = patch_size
+        
+        # Output dimension per patch: patch_size * hidden_size
+        self.patch_dim = patch_size * hidden_size
+        
+        # Single shared linear projection: hidden_size -> patch_dim
+        self.proj = nn.Linear(hidden_size, self.patch_dim, bias=bias)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: (B, P, J, C) - patch features
+            
+        Returns:
+            expanded: (B, T, J, C) where T = P * patch_size
+        """
+        B, P, J, C = x.shape
+        
+        # Rearrange to (B, J, P, C) for projection
+        x = x.permute(0, 2, 1, 3)
+        
+        # Single shared projection: (B, J, P, C) -> (B, J, P, patch_dim)
+        x = self.proj(x)
+        
+        # Reshape to frames: (B, J, P, patch_dim) -> (B, J, P, patch_size, C)
+        x = x.view(B, J, P, self.patch_size, self.hidden_size)
+        
+        # Rearrange: (B, J, P, patch_size, C) -> (B, P, patch_size, J, C)
+        x = x.permute(0, 2, 3, 1, 4)
+        
+        # Flatten: (B, P, patch_size, J, C) -> (B, T, J, C)
+        T = P * self.patch_size
+        x = x.reshape(B, T, J, self.hidden_size)
+        
+        return x
+
+
+class TwoStagePatchedPoseModel(nn.Module):
+    """
+    Two-Stage Patched Pose Model - variant using temporal patchification.
+    
+    This variant replaces bipartite matching temporal reduction with temporal patching,
+    using per-patch independent projections similar to joint grouping.
+    
+    Architecture:
+    1. Joint Grouping: Groups joints by body parts, per-group projection
+    2. Stage 1 Transformer (×N): Spatial-only attention on group tokens
+    3. Spatial UpSample: Project from groups back to joints -> (B, T, J, C)
+    4. Temporal Patchify: Per-patch projection -> (B, P, J, C) where P = T//patch_size
+    5. Stage 2 Transformer (×N): Temporal-only attention
+    6. Temporal UpSample: Per-patch projection -> (B, T, J, C)
+    7. Regression Head: Linear projection to 3D coordinates
+    
+    Args:
+        num_frame: Number of input frames (T), must be divisible by patch_size
+        num_joints: Number of joints (J), default 17 for H36M
+        in_channels: Input channels (2 for 2D poses)
+        out_channels: Output channels (3 for 3D poses)
+        hidden_size: Hidden dimension (C)
+        depth: Number of transformer blocks per stage (N)
+        num_heads: Number of attention heads
+        mlp_ratio: MLP hidden dim ratio
+        drop_rate: Dropout rate
+        attn_drop_rate: Attention dropout rate
+        drop_path_rate: Stochastic depth rate
+        patch_size: Temporal patch size (default 9)
+        joint_groups: List of joint index lists for grouping
+    """
+    def __init__(
+        self, 
+        num_frame=243, 
+        num_joints=17, 
+        in_channels=2, 
+        out_channels=3,
+        hidden_size=256, 
+        depth=3, 
+        num_heads=8, 
+        mlp_ratio=4.,
+        drop_rate=0., 
+        attn_drop_rate=0., 
+        drop_path_rate=0.2,
+        patch_size=9,
+        joint_groups=None,
+        norm_layer=None
+    ):
+        super().__init__()
+        
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        
+        assert num_frame % patch_size == 0, \
+            f"num_frame ({num_frame}) must be divisible by patch_size ({patch_size})"
+        
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.hidden_size = hidden_size
+        self.depth = depth
+        self.patch_size = patch_size
+        self.num_patches = num_frame // patch_size
+        
+        # Default H36M 17-joint skeleton groups
+        if joint_groups is None:
+            joint_groups = [
+                [1, 2, 3],        # Right Leg
+                [4, 5, 6],        # Left Leg  
+                [0, 7, 8, 9, 10], # Torso/Spine
+                [11, 12, 13],     # Left Arm
+                [14, 15, 16]      # Right Arm
+            ]
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        
+        # =====================================================================
+        # Components
+        # =====================================================================
+        
+        # Joint Grouping: (B, T, J, 2) -> (B, T, G, C)
+        self.joint_grouping = JointGrouping(
+            num_joints=num_joints,
+            in_channels=in_channels,
+            hidden_size=hidden_size,
+            joint_groups=joint_groups,
+            bias=True
+        )
+        
+        # Stage 1: Spatial-only transformer blocks
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth * 2)]
+        self.stage1_blocks = nn.ModuleList([
+            Block(
+                dim=hidden_size, 
+                num_heads=num_heads, 
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True, 
+                drop=drop_rate, 
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[i], 
+                norm_layer=norm_layer
+            )
+            for i in range(depth)
+        ])
+        self.stage1_norm = norm_layer(hidden_size)
+        
+        # Spatial UpSample: (B, T, G, C) -> (B, T, J, C)
+        self.spatial_upsample = SpatialUpSample(
+            num_groups=self.num_groups,
+            num_joints=num_joints,
+            hidden_size=hidden_size
+        )
+        
+        # Temporal Patchify: (B, T, J, C) -> (B, P, J, C)
+        self.temporal_patchify = TemporalPatchify(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            hidden_size=hidden_size,
+            patch_size=patch_size,
+            bias=True
+        )
+        
+        # Stage 2: Temporal-only transformer blocks
+        self.stage2_blocks = nn.ModuleList([
+            Block(
+                dim=hidden_size, 
+                num_heads=num_heads, 
+                mlp_ratio=mlp_ratio,
+                qkv_bias=True, 
+                drop=drop_rate, 
+                attn_drop=attn_drop_rate,
+                drop_path=dpr[depth + i], 
+                norm_layer=norm_layer
+            )
+            for i in range(depth)
+        ])
+        self.stage2_norm = norm_layer(hidden_size)
+        
+        # Temporal UpSample: (B, P, J, C) -> (B, T, J, C)
+        self.temporal_upsample = TemporalUpSample(
+            num_patches=self.num_patches,
+            num_joints=num_joints,
+            hidden_size=hidden_size,
+            patch_size=patch_size,
+            bias=True
+        )
+        
+        # Regression head
+        self.head = nn.Linear(hidden_size, out_channels)
+        
+        # Dropout
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+    
+    def forward(self, x):
+        """
+        Forward pass.
+        
+        Args:
+            x: Input 2D poses of shape (B, T, J, 2)
+            
+        Returns:
+            3D poses of shape (B, T, J, 3)
+        """
+        B, T, J, C = x.shape
+        
+        # =====================================================================
+        # Stage 1: Spatial-only processing on grouped tokens
+        # =====================================================================
+        
+        # Joint Grouping: (B, T, J, 2) -> (B, T, G, C)
+        x = self.joint_grouping(x)
+        G = x.shape[2]
+        
+        # Reshape for spatial attention: (B*T, G, C)
+        x = rearrange(x, 'b t g c -> (b t) g c')
+        x = self.pos_drop(x)
+        
+        # Stage 1 transformer blocks (spatial-only)
+        for blk in self.stage1_blocks:
+            x = blk(x)
+        x = self.stage1_norm(x)
+        
+        # Reshape back: (B, T, G, C)
+        x = rearrange(x, '(b t) g c -> b t g c', b=B, t=T)
+        
+        # Spatial UpSample: (B, T, G, C) -> (B, T, J, C)
+        x = self.spatial_upsample(x)
+        
+        # =====================================================================
+        # Temporal Patchification
+        # =====================================================================
+        
+        # (B, T, J, C) -> (B, P, J, C)
+        x = self.temporal_patchify(x)
+        P = x.shape[1]
+        
+        x = self.pos_drop(x)
+        
+        # =====================================================================
+        # Stage 2: Temporal-only processing
+        # =====================================================================
+        
+        # Reshape for temporal attention: (B*J, P, C)
+        x = rearrange(x, 'b p j c -> (b j) p c')
+        
+        for blk in self.stage2_blocks:
+            x = blk(x)
+        x = self.stage2_norm(x)
+        
+        # Reshape back: (B, P, J, C)
+        x = rearrange(x, '(b j) p c -> b p j c', b=B, j=J)
+        
+        # =====================================================================
+        # Temporal UpSample and Regression
+        # =====================================================================
+        
+        # Temporal upsample: (B, P, J, C) -> (B, T, J, C)
+        x = self.temporal_upsample(x)
+        
+        # Regression: (B, T, J, C) -> (B, T, J, 3)
+        x = self.head(x)
+        
+        return x
+
+
+# =============================================================================
 # Example Usage
 # =============================================================================
 

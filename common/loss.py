@@ -271,27 +271,26 @@ H36M_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
 # Convention: π = straight limb, smaller = more bent/flexed
 # Limits adjusted based on GT analysis to be more permissive
 DEFAULT_ANGLE_LIMITS = {
-    # Knees: allow deep flexion for sitting actions
-    # Range: ~15° (0.26 rad) to 180° (π rad)
+    # Knees: [15°, 180°] is mostly fine, observed minimums were 17°-21°
     2: (0.26, np.pi),   # Right knee
     5: (0.26, np.pi),   # Left knee
-    # Elbows: allow full flexion
-    # Range: ~15° (0.26 rad) to 180° (π rad)  
-    12: (0.26, np.pi),  # Left elbow
-    15: (0.26, np.pi),  # Right elbow
-    # Hips: very wide range for sitting/squatting
-    # Range: ~10° (0.17 rad) to 180° (π rad)
+    # Elbows: allow full flexion (observed 9° - 12°)
+    # Loosening to 0.15 rad (~8 deg)
+    12: (0.15, np.pi),  # Left elbow
+    15: (0.15, np.pi),  # Right elbow
+    # Hips: very wide range [10°, 180°], observed 59°-143°
     1: (0.17, np.pi),   # Right hip
     4: (0.17, np.pi),   # Left hip
-    # Shoulders: very flexible
-    # Range: ~15° (0.26 rad) to 180° (π rad)
+    # Shoulders: very flexible [15°, 180°], observed 55°-180°
     11: (0.26, np.pi),  # Left shoulder
     14: (0.26, np.pi),  # Right shoulder
-    # Spine joints: limited flexion
-    # Range: ~90° (π/2 rad) to 180° (π rad)
-    7: (np.pi / 2, np.pi),  # Spine (Pelvis->Spine->Thorax)
-    8: (np.pi / 3, np.pi),  # Thorax (~60° min)
-    9: (np.pi / 3, np.pi),  # Neck (~60° min)
+    # Spine joints:
+    # 7 (Spine): [90°, 180°], observed 105°-180° -> Keep as is (np.pi/2)
+    7: (np.pi / 2, np.pi), 
+    # 8 (Thorax): [60°, 180°], observed 55°-180° -> Loosen slightly to 0.8 rad (~45 deg)
+    8: (0.8, np.pi),
+    # 9 (Neck): [60°, 180°], observed 39°-165° -> Loosen to 0.5 rad (~28 deg)
+    9: (0.5, np.pi),
 }
 
 
@@ -511,8 +510,9 @@ def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
 
 def joint_angle_loss(predicted, parents=None, angle_limits=None):
     """
-    Compute joint angle limit loss using L1 penalty in radians.
-    Penalizes joint angles outside anatomically plausible ranges.
+    Compute joint angle limit loss using a smooth (non-linear) penalty in radians.
+    Penalizes joint angles outside anatomically plausible ranges. Small deviations
+    are penalized lightly (quadratically), while large deviations are penalized linearly.
     
     Args:
         predicted: Predicted 3D poses of shape (B, T, J, 3)
@@ -523,6 +523,8 @@ def joint_angle_loss(predicted, parents=None, angle_limits=None):
     Returns:
         Scalar loss value (penalty for angles outside limits, in radians)
     """
+    import torch.nn.functional as F
+    
     if parents is None:
         parents = H36M_PARENTS
     if angle_limits is None:
@@ -536,14 +538,22 @@ def joint_angle_loss(predicted, parents=None, angle_limits=None):
     for joint_idx, (min_angle, max_angle) in angle_limits.items():
         joint_angles = angles[..., joint_idx]
         
-        # Penalty for angles below minimum (over-flexion)
-        below_min = torch.relu(min_angle - joint_angles)
+        # Calculate violations (amount outside the valid range)
+        # Using clamp to isolate only the parts that violate the limits
+        below_min = torch.clamp(min_angle - joint_angles, min=0.0)
+        above_max = torch.clamp(joint_angles - max_angle, min=0.0)
         
-        # Penalty for angles above maximum
-        above_max = torch.relu(joint_angles - max_angle)
+        # Combine violations
+        violations = below_min + above_max
         
-        # L1 penalty (in radians, comparable scale to MPJPE in meters)
-        total_loss = total_loss + torch.mean(below_min + above_max)
+        # Apply Smooth L1 Loss (Huber loss)
+        # For violations < beta (e.g., 0.1 rad ~ 5.7 degrees), penalty is quadratic (0.5 * x^2 / beta)
+        # For violations >= beta, penalty is linear (x - 0.5 * beta)
+        # This means tiny violations are barely punished, while gross impossible poses are punished heavily.
+        zero_target = torch.zeros_like(violations)
+        smooth_penalty = F.smooth_l1_loss(violations, zero_target, reduction='mean', beta=0.1)
+        
+        total_loss = total_loss + smooth_penalty
         num_constrained += 1
     
     if num_constrained > 0:

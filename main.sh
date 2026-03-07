@@ -7,8 +7,8 @@
 KEYPOINTS="cpn_ft_h36m_dbb"
 # KEYPOINTS="gt"
 
-# Model selection: "mixste" or "hybrid"
-MODEL="hybrid_joint_conv"
+# Model selection: "mixste" or "hybrid" or "two_stage_grouped"
+MODEL="h2ot_mixste"
 
 args=(
     # Training settings
@@ -22,6 +22,13 @@ args=(
     
     # Model selection
     "--model" "$MODEL"
+    # Pruning strategy
+    "--pruning_strategy" "learned"
+    # H2OT hierarchical pruning settings
+    "--hierarchical_layer_indices" "1"
+    "--hierarchical_token_nums" "81"
+    # H2OT recovery strategy
+    "--recovery_strategy" "attention"   
     
     # Model settings (shared)
     "--embed_dim" "512"
@@ -31,7 +38,7 @@ args=(
     "--num_joints" "17"
     
     # HybridPoseModel specific
-    "--patch_size" "1"
+    "--patch_size" "3"
     
     # Dropout settings
     "--drop_rate" "0.0"
@@ -39,14 +46,14 @@ args=(
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings
-    "--checkpoint" "checkpoint/HybridMixSTEWithJointConv-HybridSpatialBlockV-GroupDecoderV2-patch1-5semantic-group"
+    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/Th2ot_mixste_learned-prune_attention-recovery_1layer-81"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"
     
     # DDP settings
     "--world_size" "1" 
-    "--master_port" "8501" 
+    "--master_port" "8502" 
     "--master_addr" "127.0.0.1" 
     "--reduce_rank" "0"
     

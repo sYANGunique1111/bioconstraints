@@ -33,18 +33,29 @@ args = None
 wandb_run = None
 
 
-def safe_torch_save(obj, path):
-    """Atomically save a checkpoint (safe for NFS/networked filesystems)."""
-    dir_name = os.path.dirname(path)
-    fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
-    os.close(fd)
-    try:
-        torch.save(obj, temp_path)
-        shutil.move(temp_path, path)
-    except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
+def safe_torch_save(obj, path, max_retries=3):
+    """Atomically save a checkpoint (safe for NFS/networked filesystems).
+    
+    Writes to local /tmp first to avoid PyTorch zip serialization bugs on NFS,
+    then moves the completed file to the target path.
+    """
+    for attempt in range(max_retries):
+        fd, temp_path = tempfile.mkstemp(dir='/tmp', suffix='.tmp')
+        os.close(fd)
+        try:
+            torch.save(obj, temp_path)
+            shutil.move(temp_path, path)
+            return
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f'Warning: checkpoint save failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...')
+                time.sleep(wait_time)
+            else:
+                print(f'Error: checkpoint save failed after {max_retries} attempts: {e}')
+                raise
 
 
 def save_config(args):
@@ -175,6 +186,8 @@ def runner(rank, args, train_data, test_data):
         model_params = sum(p.numel() for p in model_pos.parameters())
         model_class_name = model_pos.module.__class__.__name__
         print(f'INFO: Model: {model_class_name} | Trainable parameters: {model_params/1e6:.3f} Million')
+        
+        print(f'INFO: Warmup epochs: {args.warmup_epochs} (biomech weights ramp from 0 to target)')
         print(f'INFO: Biomech loss weights - bone: {args.weight_bone}, sym: {args.weight_symmetry}, angle: {args.weight_angle}')
         
         # Compute and log MACs/FLOPs
@@ -188,6 +201,7 @@ def runner(rank, args, train_data, test_data):
                 'parameters_million': round(model_params / 1e6, 3),
                 'macs': int(macs),
                 'macs_giga': round(macs / 1e9, 3),
+                'warmup_epochs': args.warmup_epochs,
                 'biomech_weights': {
                     'bone': args.weight_bone,
                     'symmetry': args.weight_symmetry,
@@ -217,6 +231,17 @@ def runner(rank, args, train_data, test_data):
         epoch_loss_train = 0
         epoch_loss_mpjpe = 0
         epoch_biomech = {'bone_length': 0, 'symmetry': 0, 'joint_angle': 0}
+        
+        # Compute warm-up scale factor: 0 at epoch 0, reaches 1.0 at end of warmup_epochs
+        if args.warmup_epochs > 0:
+            scale = min(1.0, (epoch + 1) / args.warmup_epochs)
+        else:
+            scale = 1.0  # No warmup: full weights immediately
+        
+        # Compute current scaled biomechanical loss weights
+        cur_weight_bone = args.weight_bone * scale
+        cur_weight_sym = args.weight_symmetry * scale
+        cur_weight_angle = args.weight_angle * scale
         N = 0
 
         model_pos.train()
@@ -236,16 +261,16 @@ def runner(rank, args, train_data, test_data):
             # Compute MPJPE loss
             loss_mpjpe = mpjpe(predicted_3d, inputs_3d)
             
-            # Compute biomechanical loss
+            # Compute biomechanical loss with warm-up scaled weights
             loss_biomech, loss_dict = biomechanical_loss(
                 predicted_3d, inputs_3d,
                 parents=skeleton_info['parents'],
                 left_joints=skeleton_info['left_joints'],
                 right_joints=skeleton_info['right_joints'],
                 angle_limits=skeleton_info['angle_limits'],
-                weight_bone=args.weight_bone,
-                weight_symmetry=args.weight_symmetry,
-                weight_angle=args.weight_angle
+                weight_bone=cur_weight_bone,
+                weight_symmetry=cur_weight_sym,
+                weight_angle=cur_weight_angle
             )
             
             # Total loss
@@ -305,7 +330,7 @@ def runner(rank, args, train_data, test_data):
         elapsed = (time.time() - start_time) / 60
         
         if dist.get_rank() == args.reduce_rank:
-            print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} '
+            print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} scale {scale:.3f} '
                   f'train {losses_train[-1]*1000:.3f}mm (mpjpe {epoch_loss_mpjpe/N*1000:.3f}) '
                   f'valid {losses_valid[-1]*1000:.3f}mm '
                   f'PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm '
@@ -315,7 +340,7 @@ def runner(rank, args, train_data, test_data):
 
             log_path = os.path.join(args.checkpoint, 'training_log.txt')
             with open(log_path, mode='a') as f:
-                f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} '
+                f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} scale {scale:.3f} '
                        f'train {losses_train[-1]*1000:.3f} '
                        f'valid {losses_valid[-1]*1000:.3f} '
                        f'PA-MPJPE {losses_p_valid[-1]*1000:.3f} '
@@ -338,6 +363,10 @@ def runner(rank, args, train_data, test_data):
                     "biomech/bone_length": biomech_losses_train["bone_length"][-1],
                     "biomech/symmetry": biomech_losses_train["symmetry"][-1],
                     "biomech/joint_angle": biomech_losses_train["joint_angle"][-1],
+                    "warmup/scale": scale,
+                    "warmup/cur_weight_bone": cur_weight_bone,
+                    "warmup/cur_weight_symmetry": cur_weight_sym,
+                    "warmup/cur_weight_angle": cur_weight_angle,
                 }
                 
                 if epoch in gradient_epochs:
@@ -395,7 +424,7 @@ def runner(rank, args, train_data, test_data):
 
 def main(args):
     print('Loading dataset...')
-    dataset_root = '/data/shuoyang67/H36m/annot'
+    dataset_root = '/data/shuoyang67/dataset/H36m/annot'
     
     # Dataset path configuration
     dataset_path = f'{dataset_root}/data_3d_{args.dataset}.npz'
@@ -509,6 +538,9 @@ if __name__ == '__main__':
         if e.errno != errno.EEXIST:
             raise RuntimeError(f'Unable to create checkpoint directory: {args.checkpoint}')
 
+    # Calculate warmup_epochs and add to args for config saving
+    args.warmup_epochs = int(0.3 * args.epochs)
+    
     # Save configuration to YAML
     save_config(args)
     
