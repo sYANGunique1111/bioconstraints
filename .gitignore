@@ -7,6 +7,8 @@ __pycache__/
 checkpoints/*
 checkpoint/*
 !checkpoint/.gitkeep
+ablation/*
+
 
 # Wandb
 wandb/
@@ -33,3 +35,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# agent
+.agent/*

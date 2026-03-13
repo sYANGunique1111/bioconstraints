@@ -32,17 +32,17 @@ args=(
     # Biomechanical loss weights (balanced for unit scales)
     # Bone/symmetry: MSE in meters (~0.0001) needs high weight to matter
     # Angle: MSE in degrees (~25) needs low weight to not dominate
-    "--weight_bone" "100.0"
-    "--weight_symmetry" "50.0"
-    "--weight_angle" "0.0"
+    "--weight_bone" "0.0"
+    "--weight_symmetry" "0.0"
+    "--weight_angle" "0.1"
     
     
     # Checkpoint settings
-    "--checkpoint" "checkpoint/biomech_mixste_cpn_h36m_100-50-0"
+    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/biomech_mixste_cpn_h36m_L1-loss_0-0-01(rectified)"
     
     # DDP settings
     "--world_size" "1" 
-    "--master_port" "8502" 
+    "--master_port" "8501" 
     "--master_addr" "127.0.0.1" 
     "--reduce_rank" "0"
     

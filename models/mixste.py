@@ -12,6 +12,12 @@ import torch.nn.functional as F
 
 from einops import rearrange
 from timm.layers import DropPath, trunc_normal_
+from common.loss import (
+    DEFAULT_ANGLE_LIMITS as LOSS_DEFAULT_ANGLE_LIMITS,
+    H36M_LEFT_JOINTS as LOSS_H36M_LEFT_JOINTS,
+    H36M_PARENTS as LOSS_H36M_PARENTS,
+    H36M_RIGHT_JOINTS as LOSS_H36M_RIGHT_JOINTS,
+)
 
 
 class Mlp(nn.Module):
@@ -1962,36 +1968,18 @@ class BiomechMixSTE(MixSTE2):
         skeleton_parents: List of parent joint indices (default: H36M 17-joint)
         left_joints: List of left-side joint indices for symmetry
         right_joints: List of right-side joint indices for symmetry
-        angle_limits: Dict mapping joint index to (min_angle, max_angle) in degrees
+        angle_limits: Dict mapping joint index to (min_angle, max_angle) in radians
     """
     
-    # Default H36M 17-joint skeleton parents
-    DEFAULT_PARENTS = [-1, 0, 1, 2, 0, 4, 5, 0, 7, 8, 9, 8, 11, 12, 8, 14, 15]
+    # Canonical biomechanical defaults live in common.loss.
+    DEFAULT_PARENTS = LOSS_H36M_PARENTS
     
     # Left/Right joint pairs for symmetry
-    DEFAULT_LEFT_JOINTS = [4, 5, 6, 11, 12, 13]   # Left leg + Left arm
-    DEFAULT_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
+    DEFAULT_LEFT_JOINTS = LOSS_H36M_LEFT_JOINTS
+    DEFAULT_RIGHT_JOINTS = LOSS_H36M_RIGHT_JOINTS
     
-    # Default joint angle limits in degrees [min, max]
-    # Convention: 180° = straight limb, smaller = more bent/flexed
-    DEFAULT_ANGLE_LIMITS = {
-        # Knees: prevent over-flexion (30° min allows deep squat)
-        2: (30.0, 180.0),   # Right knee
-        5: (30.0, 180.0),   # Left knee
-        # Elbows: prevent over-flexion
-        12: (30.0, 180.0),  # Left elbow
-        15: (30.0, 180.0),  # Right elbow
-        # Hips: wide range of motion
-        1: (30.0, 180.0),   # Right hip
-        4: (30.0, 180.0),   # Left hip
-        # Shoulders: very flexible
-        11: (20.0, 180.0),  # Left shoulder
-        14: (20.0, 180.0),  # Right shoulder
-        # Spine joints: limited flexion
-        7: (140.0, 180.0),  # Lower spine
-        8: (120.0, 180.0),  # Upper spine/thorax
-        9: (120.0, 180.0),  # Neck
-    }
+    # Default joint angle limits in radians [min, max]
+    DEFAULT_ANGLE_LIMITS = LOSS_DEFAULT_ANGLE_LIMITS
     
     def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
                  num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,

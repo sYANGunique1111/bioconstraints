@@ -25,7 +25,9 @@ from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
 from common.loss import mpjpe, p_mpjpe
 from models.mixste import MixSTE2, HybridMixSTE, HybridMixSTEV2, HybridMixSTEWithJointConv
+from models.hot.mixste import HOTMixSTE, HOTMixSTEMultiHypothesis, H2OTMixSTE, H2OTMixSTEInterp
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
+from models.efficiency_models import TwoStageGroupedPoseModel, TwoStagePatchedPoseModel
 
 # Global args (set in main)
 args = None
@@ -34,18 +36,29 @@ args = None
 wandb_run = None
 
 
-def safe_torch_save(obj, path):
-    """Atomically save a checkpoint (safe for NFS/networked filesystems)."""
-    dir_name = os.path.dirname(path)
-    fd, temp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
-    os.close(fd)
-    try:
-        torch.save(obj, temp_path)
-        shutil.move(temp_path, path)
-    except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise
+def safe_torch_save(obj, path, max_retries=3):
+    """Atomically save a checkpoint (safe for NFS/networked filesystems).
+    
+    Writes to local /tmp first to avoid PyTorch zip serialization bugs on NFS,
+    then moves the completed file to the target path.
+    """
+    for attempt in range(max_retries):
+        fd, temp_path = tempfile.mkstemp(dir='/tmp', suffix='.tmp')
+        os.close(fd)
+        try:
+            torch.save(obj, temp_path)
+            shutil.move(temp_path, path)
+            return
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f'Warning: checkpoint save failed (attempt {attempt + 1}/{max_retries}): {e}. Retrying in {wait_time}s...')
+                time.sleep(wait_time)
+            else:
+                print(f'Error: checkpoint save failed after {max_retries} attempts: {e}')
+                raise
 
 
 def save_config(args):
@@ -314,6 +327,85 @@ def runner(rank, args, train_data, test_data):
             drop_rate=args.drop_rate,
             patch_size=args.patch_size
         ).cuda()
+    elif args.model == 'two_stage_grouped':
+        model_pos = TwoStageGroupedPoseModel(
+            num_frame=args.number_of_frames,
+            num_joints=args.num_joints,
+            in_channels=2,
+            out_channels=3,
+            hidden_size=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            drop_rate=args.drop_rate,
+            joint_groups=joint_groups
+        ).cuda()
+    elif args.model == 'two_stage_patched':
+        model_pos = TwoStagePatchedPoseModel(
+            num_frame=args.number_of_frames,
+            num_joints=args.num_joints,
+            in_channels=2,
+            out_channels=3,
+            hidden_size=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            drop_rate=args.drop_rate,
+            patch_size=args.patch_size,
+            joint_groups=joint_groups
+        ).cuda()
+    elif args.model == 'hot_mixste':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        model_pos = HOTMixSTE(hot_args).cuda()
+    elif args.model == 'hot_mixste_multi':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.num_hypotheses = args.num_hypotheses
+        hot_args.symmetry_floor = args.symmetry_floor
+        hot_args.joint_angle_floor = args.joint_angle_floor
+        hot_args.score_eps = args.score_eps
+        model_pos = HOTMixSTEMultiHypothesis(hot_args).cuda()
+    elif args.model == 'h2ot_mixste':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.hierarchical_layer_indices = args.hierarchical_layer_indices
+        hot_args.hierarchical_token_nums = args.hierarchical_token_nums
+        hot_args.recovery_on_hierarchy = args.recovery_on_hierarchy
+        hot_args.recovery_layer_indices = args.recovery_layer_indices
+        hot_args.recovery_token_nums = args.recovery_token_nums
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.recovery_strategy = args.recovery_strategy
+        model_pos = H2OTMixSTE(hot_args).cuda()
+    elif args.model == 'h2ot_mixste_interp':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.hierarchical_layer_indices = args.hierarchical_layer_indices
+        hot_args.hierarchical_token_nums = args.hierarchical_token_nums
+        hot_args.recovery_on_hierarchy = args.recovery_on_hierarchy
+        hot_args.recovery_layer_indices = args.recovery_layer_indices
+        hot_args.recovery_token_nums = args.recovery_token_nums
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.recovery_strategy = "interpolation"
+        model_pos = H2OTMixSTEInterp(hot_args).cuda()
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -386,11 +478,15 @@ def runner(rank, args, train_data, test_data):
 
             optimizer.zero_grad()
 
-            # Forward pass
-            predicted_3d = model_pos(inputs_2d)
-            
-            # Compute loss
-            loss = mpjpe(predicted_3d, inputs_3d)
+            # Forward pass + training loss
+            if args.model == 'h2ot_mixste_interp' and args.use_return_pre_interp:
+                predicted_3d, pre_interp_3d, kept_indices = model_pos(inputs_2d, return_pre_interp=True)
+                gather_idx = kept_indices[:, :, None, None].expand(-1, -1, inputs_3d.shape[2], inputs_3d.shape[3])
+                target_3d_pruned = torch.gather(inputs_3d, 1, gather_idx)
+                loss = mpjpe(pre_interp_3d, target_3d_pruned)
+            else:
+                predicted_3d = model_pos(inputs_2d)
+                loss = mpjpe(predicted_3d, inputs_3d)
             loss.backward()
 
             epoch_loss_train += inputs_3d.shape[0] * inputs_3d.shape[1] * loss.item()

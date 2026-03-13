@@ -39,7 +39,7 @@ args=(
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings - separate directory for video-based variant
-    "--checkpoint" "checkpoint/mixste_cpn_h36m_video_clip_based"
+    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/mixste_cpn_h36m_video_clip_based"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"
