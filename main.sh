@@ -7,14 +7,14 @@
 KEYPOINTS="cpn_ft_h36m_dbb"
 # KEYPOINTS="gt"
 
-# Model selection: "mixste" or "hybrid" or "two_stage_grouped"
-MODEL="h2ot_mixste"
+# Model selection: "mixste", "hot_mixste", "hot_mixste_multi", or "h2ot_mixste"
+MODEL="hot_mixste_multi"
 
 args=(
     # Training settings
     "--epochs" "150" 
     "--number_of_frames" "243"
-    "--batch_size" "1024"
+    "--batch_size" "972"
     "--learning_rate" "0.00004"
     "--lr_decay" "0.99"
     "--dataset" "h36m"
@@ -23,12 +23,15 @@ args=(
     # Model selection
     "--model" "$MODEL"
     # Pruning strategy
-    "--pruning_strategy" "learned"
-    # H2OT hierarchical pruning settings
-    "--hierarchical_layer_indices" "1"
-    "--hierarchical_token_nums" "81"
-    # H2OT recovery strategy
-    "--recovery_strategy" "attention"   
+    "--pruning_strategy" "cluster"
+    # HOT/H2OT pruning settings
+    "--layer_index" "3"
+    "--token_num" "81"
+    # Multi-hypothesis HOT settings
+    "--num_hypotheses" "5"
+    "--symmetry_floor" "1e-3"
+    "--joint_angle_floor" "1e-3"
+    "--score_eps" "1e-8"
     
     # Model settings (shared)
     "--embed_dim" "512"
@@ -40,13 +43,13 @@ args=(
     # HybridPoseModel specific
     "--patch_size" "3"
     
-    # Dropout settings
+    # Dropout settings  
     "--drop_rate" "0.0"
     "--attn_drop_rate" "0.0"
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings
-    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/Th2ot_mixste_learned-prune_attention-recovery_1layer-81"
+    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/Thot_mixste_multi_cluster-prune_3layer-81_h5"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"

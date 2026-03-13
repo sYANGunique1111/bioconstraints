@@ -6,6 +6,14 @@ from functools import partial
 from timm.layers import DropPath
 from einops import rearrange, repeat
 from .token_selector import TokenSelector
+from common.loss import (
+    H36M_LEFT_JOINTS,
+    H36M_PARENTS,
+    H36M_RIGHT_JOINTS,
+    DEFAULT_ANGLE_LIMITS,
+    compute_bone_lengths,
+    compute_joint_angles,
+)
 
 
 def index_points(points, idx):
@@ -158,6 +166,47 @@ class Block(nn.Module):
         return x
 
 
+def symmetry_penalty_per_frame(predicted, parents=None, left_joints=None, right_joints=None):
+    if parents is None:
+        parents = H36M_PARENTS
+    if left_joints is None:
+        left_joints = H36M_LEFT_JOINTS
+    if right_joints is None:
+        right_joints = H36M_RIGHT_JOINTS
+
+    pred_lengths = compute_bone_lengths(predicted, parents)
+    left_lengths = pred_lengths[..., left_joints]
+    right_lengths = pred_lengths[..., right_joints]
+    return torch.abs(left_lengths - right_lengths).mean(dim=-1)
+
+
+def joint_angle_penalty_per_frame(predicted, parents=None, angle_limits=None, beta=0.1):
+    if parents is None:
+        parents = H36M_PARENTS
+    if angle_limits is None:
+        angle_limits = DEFAULT_ANGLE_LIMITS
+
+    angles = compute_joint_angles(predicted, parents)
+    penalties = []
+
+    for joint_idx, (min_angle, max_angle) in angle_limits.items():
+        joint_angles = angles[..., joint_idx]
+        below_min = torch.clamp(min_angle - joint_angles, min=0.0)
+        above_max = torch.clamp(joint_angles - max_angle, min=0.0)
+        violations = below_min + above_max
+        smooth_penalty = torch.where(
+            violations < beta,
+            0.5 * violations.square() / beta,
+            violations - 0.5 * beta,
+        )
+        penalties.append(smooth_penalty)
+
+    if not penalties:
+        return torch.zeros_like(angles[..., 0])
+
+    return torch.stack(penalties, dim=-1).mean(dim=-1)
+
+
 class Model(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -209,7 +258,14 @@ class Model(nn.Module):
             for i in range(depth)])
 
         self.x_token = nn.Parameter(torch.zeros(1, self.recover_num, embed_dim))
-        self.token_selector = TokenSelector(embed_dim, hidden_dim=mlp_hidden_dim, drop=drop_rate, gate_scale=0.1)
+        self.token_selector = None
+        if self.pruning_strategy == "learned":
+            self.token_selector = TokenSelector(
+                embed_dim,
+                hidden_dim=mlp_hidden_dim,
+                drop=drop_rate,
+                gate_scale=0.1,
+            )
 
         self.cross_attention = Cross_Attention(embed_dim, num_heads=num_heads, qkv_bias=qkv_bias, \
             qk_scale=qk_scale, attn_drop=attn_drop_rate, proj_drop=drop_rate)
@@ -235,11 +291,13 @@ class Model(nn.Module):
         return x[batch_ind, index]
 
     def _learned_prune_temporal_tokens(self, x):
+        if self.token_selector is None:
+            raise ValueError("Token selector is not initialized. Set pruning_strategy='learned' to use learned pruning.")
         selected, _, _ = self.token_selector(x, self.token_num)
         return selected
 
-    def forward(self, x):
-        b, f, n, c = x.shape
+    def _encode_tokens(self, x):
+        b, f, n, _ = x.shape
 
         x = rearrange(x, 'b f n c  -> (b f) n c')
         x = self.Spatial_patch_to_embedding(x)
@@ -256,7 +314,6 @@ class Model(nn.Module):
 
         x = rearrange(x, '(b n) f c -> b f n c', n=n)
         for i in range(1, self.block_depth):
-            ##-----------------Clusteing-----------------##
             if i == self.layer_index:
                 if self.pruning_strategy == "cluster":
                     x = self._cluster_temporal_tokens(x)
@@ -272,7 +329,7 @@ class Model(nn.Module):
             x = rearrange(x, 'b f n c -> (b f) n c')
             steblock = self.STEblocks[i]
             tteblock = self.TTEblocks[i]
-            
+
             x = steblock(x)
             x = self.Spatial_norm(x)
             x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
@@ -281,16 +338,63 @@ class Model(nn.Module):
             x = self.Temporal_norm(x)
             x = rearrange(x, '(b n) f c -> b f n c', n=n)
 
+        return x
+
+    def _recover_output(self, x):
+        b, _, n, _ = x.shape
         x = rearrange(x, 'b f n c -> (b n) f c')
-        x_token = repeat(self.x_token, '() f c -> b f c', b = b*n)
+        x_token = repeat(self.x_token, '() f c -> b f c', b=b * n)
         x = x_token + self.cross_attention(x_token, x, x)
         x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        return self.head(x)
 
-        x = self.head(x)
-
-        x = x.view(b, -1, n, 3)
-
+    def forward(self, x):
+        x = self._encode_tokens(x)
+        x = self._recover_output(x)
         return x
+
+
+class MultiHypothesisModel(Model):
+    def __init__(self, args):
+        super().__init__(args)
+        self.num_hypotheses = getattr(args, "num_hypotheses", 4)
+        self.symmetry_floor = getattr(args, "symmetry_floor", 1e-3)
+        self.joint_angle_floor = getattr(args, "joint_angle_floor", 1e-3)
+        self.score_eps = getattr(args, "score_eps", 1e-8)
+        self.x_token = nn.Parameter(
+            torch.zeros(1, self.num_hypotheses, self.recover_num, args.channel)
+        )
+
+    def _recover_all_hypotheses(self, x):
+        b, _, n, _ = x.shape
+        source = rearrange(x, 'b f n c -> (b n) f c')
+        source = repeat(source, 'bn f c -> (bn h) f c', h=self.num_hypotheses)
+        x_token = repeat(self.x_token, '() h f c -> (b n h) f c', b=b, n=n)
+        recovered = x_token + self.cross_attention(x_token, source, source)
+        recovered = rearrange(recovered, '(b n h) f c -> b h f n c', b=b, n=n, h=self.num_hypotheses)
+        return self.head(recovered)
+
+    def _select_best_hypothesis(self, hypotheses):
+        sym_loss = symmetry_penalty_per_frame(hypotheses)
+        joint_loss = joint_angle_penalty_per_frame(hypotheses)
+
+        sym_adj = sym_loss + self.symmetry_floor
+        joint_adj = joint_loss + self.joint_angle_floor
+
+        norm_sym = sym_adj / (sym_adj.sum(dim=1, keepdim=True) + self.score_eps)
+        norm_joint = joint_adj / (joint_adj.sum(dim=1, keepdim=True) + self.score_eps)
+        scores = norm_sym * norm_joint
+
+        best_idx = scores.argmin(dim=1)
+        gather_idx = best_idx[:, None, :, None, None].expand(-1, 1, -1, hypotheses.shape[3], hypotheses.shape[4])
+        best = hypotheses.gather(dim=1, index=gather_idx).squeeze(1)
+        return best
+
+    def forward(self, x):
+        encoded = self._encode_tokens(x)
+        hypotheses = self._recover_all_hypotheses(encoded)
+        return self._select_best_hypothesis(hypotheses)
+
 
 if __name__ == '__main__':
     import argparse
@@ -322,8 +426,5 @@ if __name__ == '__main__':
     print('macs: ', macs/1000000, 'params: ', params/1000000)
     macs, params = clever_format([macs*2, params], "%.3f")
     print(macs, params)
-
-
-
 
 

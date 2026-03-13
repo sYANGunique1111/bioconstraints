@@ -25,7 +25,7 @@ from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
 from common.loss import mpjpe, p_mpjpe
 from models.mixste import MixSTE2, HybridMixSTE, HybridMixSTEV2, HybridMixSTEWithJointConv
-from models.hot.mixste import HOTMixSTE, H2OTMixSTE, H2OTMixSTEInterp
+from models.hot.mixste import HOTMixSTE, HOTMixSTEMultiHypothesis, H2OTMixSTE, H2OTMixSTEInterp
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
 from models.efficiency_models import TwoStageGroupedPoseModel, TwoStagePatchedPoseModel
 
@@ -363,6 +363,19 @@ def runner(rank, args, train_data, test_data):
         hot_args.layer_index = args.layer_index
         hot_args.pruning_strategy = args.pruning_strategy
         model_pos = HOTMixSTE(hot_args).cuda()
+    elif args.model == 'hot_mixste_multi':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.num_hypotheses = args.num_hypotheses
+        hot_args.symmetry_floor = args.symmetry_floor
+        hot_args.joint_angle_floor = args.joint_angle_floor
+        hot_args.score_eps = args.score_eps
+        model_pos = HOTMixSTEMultiHypothesis(hot_args).cuda()
     elif args.model == 'h2ot_mixste':
         hot_args = type('HotArgs', (), {})()
         hot_args.frames = args.number_of_frames

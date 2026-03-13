@@ -6,6 +6,8 @@ __pycache__/
 # Checkpoints (ignore contents, keep folder visible to IDE)
 checkpoint/*
 !checkpoint/.gitkeep
+ablation/*
+
 
 # Wandb
 wandb/
