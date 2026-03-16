@@ -1,17 +1,15 @@
 #!/bin/bash
 set -euo pipefail
 
-# Training launcher for local or Slurm execution.
+# Training launcher for Slurm execution on this cluster.
 #
-# Local example:
+# Examples:
 #   bash main.sh
-#
-# Slurm examples:
-#   bash main.sh --slurm --partition COOP --gpus 1
-#   bash main.sh --slurm --partition FARM --gpus 2 --time 12:00:00
+#   bash main.sh --partition COOP --gpus 1
+#   bash main.sh --partition FARM --gpus 2 --time 12:00:00
 #
 # Pass extra training args to main.py after `--`, e.g.:
-#   bash main.sh --slurm --partition COOP -- --epochs 200
+#   bash main.sh --partition COOP -- --epochs 200
 
 if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     SCRIPT_DIR="${SLURM_SUBMIT_DIR}"
@@ -28,9 +26,9 @@ CHECKPOINT_DIR="test"
 # Runtime defaults (conservative and server-friendly)
 # COOP: gpu:4090, 110 GB RAM/node
 # FARM: gpu:a100, 366 GB RAM/node
-RUN_MODE="local"
 PARTITION="COOP"
 GPU_TYPE=""          # Auto-set from partition if not provided.
+NODELIST=""
 GPUS=1               # Number of GPUs requested. Also used as world_size.
 CPUS_PER_TASK=8      # CPU threads available to each training process.
 MEMORY="48G"         # Total memory for the job.
@@ -41,8 +39,6 @@ MASTER_PORT="8501"
 MODULE_PYTORCH="PyTorch/2.1.2-foss-2023a-CUDA-12.1.1"
 MODULE_EINOPS="einops/0.7.0-GCCcore-12.3.0"
 MODULE_TIMM="timm/1.0.3-foss-2023a-CUDA-12.1.1"
-MODULE_WANDB="wandb/0.16.1-GCC-12.3.0"
-USE_WANDB=0
 PYTHON_BIN="python3"
 
 EXTRA_ARGS=()
@@ -53,9 +49,8 @@ Usage:
   bash main.sh [launcher-options] [-- extra-main.py-args]
 
 Launcher options:
-  --slurm                    Submit with sbatch.
-  --local                    Run directly (default).
   --partition <COOP|FARM>    Slurm partition.
+  --nodelist <NODE[,NODE]>   Restrict the job to specific Slurm node names.
   --gpu-type <4090|a100>     GRES GPU type; auto-selected from partition if omitted.
   --gpus <N>                 Number of GPUs to request (also sets --world_size).
   --cpus <N>                 --cpus-per-task.
@@ -66,9 +61,6 @@ Launcher options:
   --module-pytorch <MODULE>  PyTorch module to load.
   --module-einops <MODULE>   einops module required by models/mixste.py.
   --module-timm <MODULE>     timm module required by models/mixste.py.
-  --module-wandb <MODULE>    wandb module to load when --wandb is enabled.
-  --wandb                    Enable W&B logging (adds --wandb to main.py).
-  --no-wandb                 Disable W&B logging (default).
   --python <BIN>             Python executable (default: python3).
   -h, --help                 Show this help.
 EOF
@@ -76,16 +68,12 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --slurm)
-            RUN_MODE="slurm"
-            shift
-            ;;
-        --local)
-            RUN_MODE="local"
-            shift
-            ;;
         --partition)
             PARTITION="$2"
+            shift 2
+            ;;
+        --nodelist)
+            NODELIST="$2"
             shift 2
             ;;
         --gpu-type)
@@ -127,18 +115,6 @@ while [[ $# -gt 0 ]]; do
         --module-timm)
             MODULE_TIMM="$2"
             shift 2
-            ;;
-        --module-wandb)
-            MODULE_WANDB="$2"
-            shift 2
-            ;;
-        --wandb)
-            USE_WANDB=1
-            shift
-            ;;
-        --no-wandb)
-            USE_WANDB=0
-            shift
             ;;
         --python)
             PYTHON_BIN="$2"
@@ -201,19 +177,12 @@ TRAIN_ARGS=(
     "--nolog"
 )
 
-if [[ "${USE_WANDB}" == "1" ]]; then
-    TRAIN_ARGS+=("--wandb")
-fi
-
-if [[ "${RUN_MODE}" == "slurm" && -z "${SLURM_JOB_ID:-}" ]]; then
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     echo "Submitting Slurm job on ${PARTITION} with gpu:${GPU_TYPE}:${GPUS}, cpu:${CPUS_PER_TASK}, mem:${MEMORY}, time:${TIME_LIMIT}"
-    WANDB_FORWARD="--no-wandb"
-    if [[ "${USE_WANDB}" == "1" ]]; then
-        WANDB_FORWARD="--wandb"
-    fi
     sbatch \
         --job-name="${JOB_NAME}" \
         --partition="${PARTITION}" \
+        ${NODELIST:+--nodelist="${NODELIST}"} \
         --nodes=1 \
         --ntasks=1 \
         --cpus-per-task="${CPUS_PER_TASK}" \
@@ -221,8 +190,9 @@ if [[ "${RUN_MODE}" == "slurm" && -z "${SLURM_JOB_ID:-}" ]]; then
         --mem="${MEMORY}" \
         --time="${TIME_LIMIT}" \
         --output="${SLURM_LOG_DIR}/%x.%j.out" \
-        "$0" --local \
+        "$0" \
         --partition "${PARTITION}" \
+        ${NODELIST:+--nodelist "${NODELIST}"} \
         --gpu-type "${GPU_TYPE}" \
         --gpus "${GPUS}" \
         --cpus "${CPUS_PER_TASK}" \
@@ -233,8 +203,6 @@ if [[ "${RUN_MODE}" == "slurm" && -z "${SLURM_JOB_ID:-}" ]]; then
         --module-pytorch "${MODULE_PYTORCH}" \
         --module-einops "${MODULE_EINOPS}" \
         --module-timm "${MODULE_TIMM}" \
-        --module-wandb "${MODULE_WANDB}" \
-        "${WANDB_FORWARD}" \
         --python "${PYTHON_BIN}" \
         -- "${EXTRA_ARGS[@]}"
     exit 0
@@ -249,9 +217,6 @@ module purge
 module load "${MODULE_PYTORCH}"
 module load "${MODULE_EINOPS}"
 module load "${MODULE_TIMM}"
-if [[ "${USE_WANDB}" == "1" ]]; then
-    module load "${MODULE_WANDB}"
-fi
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"

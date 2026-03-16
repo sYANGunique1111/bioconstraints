@@ -46,7 +46,6 @@ STAGE2_ARGS=(
     "--checkpoint" "${STAGE2_CHECKPOINT_DIR}"
     "--resume" "${STAGE1_RESUME}"
     "--master_port" "${MASTER_PORT_STAGE2}"
-    "--wandb"
 )
 
 mkdir -p "${STAGE1_CHECKPOINT_DIR}" "${STAGE2_CHECKPOINT_DIR}"

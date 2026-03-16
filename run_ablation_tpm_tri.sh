@@ -49,9 +49,6 @@ args=(
     "--master_port" "8500"
     "--master_addr" "127.0.0.1"
     "--reduce_rank" "0"
-
-    # Logging
-    "--wandb"
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL

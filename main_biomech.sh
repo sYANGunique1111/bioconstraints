@@ -1,55 +1,224 @@
 #!/bin/bash
+set -euo pipefail
 
-# Training script for BiomechMixSTE with biomechanical constraints
-# Usage: bash main_biomech.sh
+# Training launcher for biomechanical-constraint runs on this Slurm cluster.
+#
+# Default example:
+#   bash main_biomech.sh
+#
+# Override resources or args:
+#   bash main_biomech.sh --partition FARM --gpus 2 --time 12:00:00
+#   bash main_biomech.sh -- --epochs 200 --weight_angle 0.05
 
-# Keypoints configuration
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    SCRIPT_DIR="${SLURM_SUBMIT_DIR}"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+cd "${SCRIPT_DIR}"
+
+# Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
-# KEYPOINTS="gt"
+CHECKPOINT_DIR="biomech_mixste_cpn_h36m_L1-loss_0-10-0(rectified)"
 
-args=(
-    # Training settings
-    "--epochs" "120" 
+# Runtime defaults
+# COOP: gpu:4090, 110 GB RAM/node
+# FARM: gpu:a100, 366 GB RAM/node
+PARTITION="COOP"
+GPU_TYPE=""
+NODELIST=""
+GPUS=2
+CPUS_PER_TASK=8
+MEMORY="24G"
+TIME_LIMIT="25:00:00"
+JOB_NAME="bioconstraints-biomech"
+SLURM_LOG_DIR="${SCRIPT_DIR}/checkpoints/${CHECKPOINT_DIR}"
+MASTER_PORT="8502"
+MODULE_PYTORCH="PyTorch/2.1.2-foss-2023a-CUDA-12.1.1"
+MODULE_EINOPS="einops/0.7.0-GCCcore-12.3.0"
+MODULE_TIMM="timm/1.0.3-foss-2023a-CUDA-12.1.1"
+PYTHON_BIN="python3"
+
+EXTRA_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash main_biomech.sh [launcher-options] [-- extra-main_biomech.py-args]
+
+Launcher options:
+  --partition <COOP|FARM>    Slurm partition.
+  --nodelist <NODE[,NODE]>   Restrict the job to specific Slurm node names.
+  --gpu-type <4090|a100>     GRES GPU type; auto-selected from partition if omitted.
+  --gpus <N>                 Number of GPUs to request (also sets --world_size).
+  --cpus <N>                 --cpus-per-task.
+  --mem <SIZE>               --mem (examples: 48G, 120G).
+  --time <HH:MM:SS>          --time.
+  --job-name <NAME>          Slurm job name.
+  --master-port <PORT>       DDP master port.
+  --module-pytorch <MODULE>  PyTorch module to load.
+  --module-einops <MODULE>   einops module required by models/mixste.py.
+  --module-timm <MODULE>     timm module required by models/mixste.py.
+  --python <BIN>             Python executable (default: python3).
+  -h, --help                 Show this help.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --partition)
+            PARTITION="$2"
+            shift 2
+            ;;
+        --nodelist)
+            NODELIST="$2"
+            shift 2
+            ;;
+        --gpu-type)
+            GPU_TYPE="$2"
+            shift 2
+            ;;
+        --gpus)
+            GPUS="$2"
+            shift 2
+            ;;
+        --cpus)
+            CPUS_PER_TASK="$2"
+            shift 2
+            ;;
+        --mem)
+            MEMORY="$2"
+            shift 2
+            ;;
+        --time)
+            TIME_LIMIT="$2"
+            shift 2
+            ;;
+        --job-name)
+            JOB_NAME="$2"
+            shift 2
+            ;;
+        --master-port)
+            MASTER_PORT="$2"
+            shift 2
+            ;;
+        --module-pytorch)
+            MODULE_PYTORCH="$2"
+            shift 2
+            ;;
+        --module-einops)
+            MODULE_EINOPS="$2"
+            shift 2
+            ;;
+        --module-timm)
+            MODULE_TIMM="$2"
+            shift 2
+            ;;
+        --python)
+            PYTHON_BIN="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            EXTRA_ARGS+=("$@")
+            break
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "${GPU_TYPE}" ]]; then
+    if [[ "${PARTITION}" == "FARM" ]]; then
+        GPU_TYPE="a100"
+    else
+        GPU_TYPE="4090"
+    fi
+fi
+
+if [[ ! -d "${SCRIPT_DIR}/checkpoints" ]]; then
+    mkdir -p "${SCRIPT_DIR}/checkpoints"
+fi
+if [[ ! -d "${SLURM_LOG_DIR}" ]]; then
+    mkdir -p "${SLURM_LOG_DIR}"
+fi
+
+TRAIN_ARGS=(
+    "--epochs" "120"
     "--number_of_frames" "243"
     "--batch_size" "1024"
     "--learning_rate" "0.00004"
     "--lr_decay" "0.99"
     "--dataset" "h36m"
-    "--keypoints" "$KEYPOINTS"
-    
-    # Model settings (BiomechMixSTE uses same arch as MixSTE2)
+    "--keypoints" "${KEYPOINTS}"
     "--embed_dim" "512"
     "--depth" "8"
     "--num_heads" "8"
     "--mlp_ratio" "2"
     "--num_joints" "17"
-    
-    # Dropout settings
     "--drop_rate" "0.0"
     "--attn_drop_rate" "0.0"
     "--drop_path_rate" "0.0"
-    
-    # Biomechanical loss weights (balanced for unit scales)
-    # Bone/symmetry: MSE in meters (~0.0001) needs high weight to matter
-    # Angle: MSE in degrees (~25) needs low weight to not dominate
     "--weight_bone" "0.0"
-    "--weight_symmetry" "0.0"
-    "--weight_angle" "0.1"
-    
-    
-    # Checkpoint settings
-    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/biomech_mixste_cpn_h36m_L1-loss_0-0-01(rectified)"
-    
-    # DDP settings
-    "--world_size" "1" 
-    "--master_port" "8501" 
-    "--master_addr" "127.0.0.1" 
+    "--weight_symmetry" "10.0"
+    "--weight_angle" "0.0"
+    "--checkpoint" "checkpoints/${CHECKPOINT_DIR}"
+    "--world_size" "${GPUS}"
+    "--master_port" "${MASTER_PORT}"
+    "--master_addr" "127.0.0.1"
     "--reduce_rank" "0"
-    
-    # Other options
     "--nolog"
-    "--wandb"  # Uncomment to enable W&B logging
 )
 
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    echo "Submitting Slurm job on ${PARTITION} with gpu:${GPU_TYPE}:${GPUS}, cpu:${CPUS_PER_TASK}, mem:${MEMORY}, time:${TIME_LIMIT}"
+    sbatch \
+        --job-name="${JOB_NAME}" \
+        --partition="${PARTITION}" \
+        ${NODELIST:+--nodelist="${NODELIST}"} \
+        --nodes=1 \
+        --ntasks=1 \
+        --cpus-per-task="${CPUS_PER_TASK}" \
+        --gres="gpu:${GPU_TYPE}:${GPUS}" \
+        --mem="${MEMORY}" \
+        --time="${TIME_LIMIT}" \
+        --output="${SLURM_LOG_DIR}/%x.%j.out" \
+        "$0" \
+        --partition "${PARTITION}" \
+        ${NODELIST:+--nodelist "${NODELIST}"} \
+        --gpu-type "${GPU_TYPE}" \
+        --gpus "${GPUS}" \
+        --cpus "${CPUS_PER_TASK}" \
+        --mem "${MEMORY}" \
+        --time "${TIME_LIMIT}" \
+        --job-name "${JOB_NAME}" \
+        --master-port "${MASTER_PORT}" \
+        --module-pytorch "${MODULE_PYTORCH}" \
+        --module-einops "${MODULE_EINOPS}" \
+        --module-timm "${MODULE_TIMM}" \
+        --python "${PYTHON_BIN}" \
+        -- "${EXTRA_ARGS[@]}"
+    exit 0
+fi
+
+if ! type module >/dev/null 2>&1; then
+    source /etc/profile
+fi
+
+module purge
+module load "${MODULE_PYTORCH}"
+module load "${MODULE_EINOPS}"
+module load "${MODULE_TIMM}"
+
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-CUDA_VISIBLE_DEVICES="0" python main_biomech.py ${args[@]}
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export OMP_NUM_THREADS="${CPUS_PER_TASK}"
+
+echo "Running biomech training with ${PYTHON_BIN} on $(hostname)"
+"${PYTHON_BIN}" main_biomech.py "${TRAIN_ARGS[@]}" "${EXTRA_ARGS[@]}"
