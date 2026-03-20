@@ -817,6 +817,145 @@ class HybridJointSemanticEmbedder(nn.Module):
         return tokens
 
 
+class HybridJointWiseEmbedder(nn.Module):
+    """
+    Patch embedder with a unique projection per joint OR per temporal patch.
+
+    embed_mode='joint'  (default):
+        Weight shape (J, patch_dim, hidden_size).  Each joint has its own
+        projection, shared across all time patches.
+        einsum: 'btjp,jph->btjh'
+
+    embed_mode='temporal':
+        Weight shape (T_patches, patch_dim, hidden_size).  Each time-patch
+        position has its own projection, shared across all joints.
+        einsum: 'btjp,tph->btjh'
+
+    Output shape: (B, T_patches, num_joints, hidden_size)
+    """
+    SUPPORTED_EMBED_MODES = ('joint', 'temporal')
+
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, in_channels=2,
+                 hidden_size=512, bias=True, use_normalized_graph=False,
+                 embed_mode='joint'):
+        super().__init__()
+        assert embed_mode in self.SUPPORTED_EMBED_MODES, \
+            f"Unknown embed_mode: {embed_mode}. Must be one of {self.SUPPORTED_EMBED_MODES}"
+
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.in_channels = in_channels
+        self.hidden_size = hidden_size
+        self.num_time_patches = num_frame // patch_size
+        self.patch_dim = patch_size * in_channels
+        self.use_normalized_graph = use_normalized_graph
+        self.embed_mode = embed_mode
+
+        if embed_mode == 'joint':
+            # (J, patch_dim, hidden_size) — one projection per joint
+            self.joint_weight = nn.Parameter(torch.empty(num_joints, self.patch_dim, hidden_size))
+        else:  # 'temporal'
+            # (T_patches, patch_dim, hidden_size) — one projection per time-patch
+            self.temporal_weight = nn.Parameter(torch.empty(self.num_time_patches, self.patch_dim, hidden_size))
+        if bias:
+            if embed_mode == 'joint':
+                self.joint_bias = nn.Parameter(torch.zeros(num_joints, hidden_size))
+            else:  # 'temporal'
+                self.temporal_bias = nn.Parameter(torch.zeros(self.num_time_patches, hidden_size))
+        else:
+            self.register_parameter('joint_bias', None)
+            self.register_parameter('temporal_bias', None)
+
+        temporal_pe = self._create_sinusoidal_pe(self.num_time_patches, hidden_size)
+        self.register_buffer('temporal_pe', temporal_pe)
+
+        joint_pe = self._create_sinusoidal_pe(num_joints, hidden_size)
+        self.register_buffer('joint_spatial_pe', joint_pe)
+
+        if use_normalized_graph:
+            normalized_adj = self._create_normalized_h36m_graph(num_joints)
+            self.register_buffer('normalized_joint_graph', normalized_adj)
+        else:
+            self.register_buffer('normalized_joint_graph', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.embed_mode == 'joint':
+            trunc_normal_(self.joint_weight, std=.02)
+            if self.joint_bias is not None:
+                nn.init.constant_(self.joint_bias, 0)
+        else:  # 'temporal'
+            trunc_normal_(self.temporal_weight, std=.02)
+            if self.temporal_bias is not None:
+                nn.init.constant_(self.temporal_bias, 0)
+
+    def _create_sinusoidal_pe(self, num_positions, dim):
+        """Create fixed sinusoidal positional embeddings."""
+        pe = torch.zeros(1, num_positions, dim)
+        position = torch.arange(0, num_positions, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2).float() * (-math.log(10000.0) / dim))
+
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+
+        return pe
+
+    def _create_normalized_h36m_graph(self, num_joints):
+        """Create fixed symmetric normalized adjacency with self-loops for H36M joints."""
+        adj = torch.zeros(num_joints, num_joints, dtype=torch.float32)
+
+        for child, parent in enumerate(LOSS_H36M_PARENTS):
+            if parent < 0 or child >= num_joints or parent >= num_joints:
+                continue
+            adj[child, parent] = 1.0
+            adj[parent, child] = 1.0
+
+        adj = adj + torch.eye(num_joints, dtype=torch.float32)
+        degree = adj.sum(dim=1)
+        inv_sqrt_degree = degree.pow(-0.5)
+        inv_sqrt_degree[torch.isinf(inv_sqrt_degree)] = 0.0
+        d_inv_sqrt = torch.diag(inv_sqrt_degree)
+
+        return d_inv_sqrt @ adj @ d_inv_sqrt
+
+    def forward(self, x):
+        """
+        Args:
+            x: (B, T, J, C) - 2D poses
+
+        Returns:
+            joint_tokens: (B, T_patches, J, hidden_size)
+        """
+        B, T, J, C = x.shape
+        P_t = self.patch_size
+        T_patches = T // P_t
+
+        x = x.view(B, T_patches, P_t, J, C)
+        x = x.permute(0, 1, 3, 2, 4).contiguous()
+        x = x.view(B, T_patches, J, self.patch_dim)
+
+        if self.embed_mode == 'joint':
+            joint_tokens = torch.einsum('btjp,jph->btjh', x, self.joint_weight)
+            if self.joint_bias is not None:
+                joint_tokens = joint_tokens + self.joint_bias.unsqueeze(0).unsqueeze(0)
+        else:  # 'temporal'
+            joint_tokens = torch.einsum('btjp,tph->btjh', x, self.temporal_weight)
+            if self.temporal_bias is not None:
+                joint_tokens = joint_tokens + self.temporal_bias.unsqueeze(0).unsqueeze(2)
+
+        if self.use_normalized_graph:
+            graph_tokens = torch.einsum('ij,btjh->btih', self.normalized_joint_graph, joint_tokens)
+            joint_tokens = joint_tokens + graph_tokens
+
+        temporal_pe = self.temporal_pe.unsqueeze(2)
+        joint_pe = self.joint_spatial_pe.unsqueeze(1)
+        joint_tokens = joint_tokens + temporal_pe + joint_pe
+
+        return joint_tokens
+
+
 class HybridMixSTEDecoder(nn.Module):
     """
     Decoder for HybridMixSTE that maps body-part tokens back to joint predictions.
@@ -969,6 +1108,257 @@ class SimpleJointDecoder(nn.Module):
         output = output.view(B, T_patches * P_t, J, C_out)
         
         return output
+
+
+class InterpolatingJointDecoder(nn.Module):
+    """
+    Decoder that predicts one 3D pose per compressed token and linearly
+    interpolates those predictions back to the full frame count.
+
+    Input: (B, T_patches, J, hidden_size)
+    Output: (B, T, J, out_channels)
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, hidden_size=512, out_channels=3):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, out_channels)
+        )
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, J, hidden_size)
+
+        Returns:
+            poses_3d: (B, T, J, out_channels)
+        """
+        B, T_patches, J, C = tokens.shape
+
+        sparse_output = self.head(tokens)  # (B, T_patches, J, out_channels)
+        sparse_output = rearrange(sparse_output, 'b t j c -> b (j c) t')
+        output = F.interpolate(
+            sparse_output, size=self.num_frame, mode='linear', align_corners=True
+        )
+        output = rearrange(output, 'b (j c) t -> b t j c', j=J, c=self.out_channels)
+
+        return output
+
+
+class UpsamplingJointDecoder(nn.Module):
+    """
+    Decoder that first upsamples compressed temporal tokens to the full frame
+    resolution with ConvTranspose1d, then regresses each recovered frame to 3D.
+
+    Input: (B, T_patches, J, hidden_size)
+    Output: (B, T, J, out_channels)
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, hidden_size=512, out_channels=3):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        self.num_time_patches = num_frame // patch_size
+
+        self.temporal_upsample = nn.ConvTranspose1d(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=patch_size,
+            stride=patch_size,
+            padding=0,
+            output_padding=0,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, out_channels)
+        )
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, J, hidden_size)
+
+        Returns:
+            poses_3d: (B, T, J, out_channels)
+        """
+        B, T_patches, J, C = tokens.shape
+        assert T_patches == self.num_time_patches, \
+            f"Expected {self.num_time_patches} compressed frames, got {T_patches}"
+
+        tokens = rearrange(tokens, 'b t j c -> (b j) c t')
+        upsampled = self.temporal_upsample(tokens)  # (B*J, hidden_size, T)
+        upsampled = rearrange(upsampled, '(b j) c t -> b t j c', b=B, j=J)
+
+        output = self.head(upsampled)  # (B, T, J, out_channels)
+        return output
+
+
+class JointDecoder(nn.Module):
+    """
+    Unified decoder for per-joint tokens with configurable temporal recovery.
+
+    Modes:
+        - "one_step_interp": Project to 3D, then linearly interpolate to full resolution.
+        - "one_step_upsample": ConvTranspose1d in feature space to full resolution,
+          then project to 3D.
+        - "two_step_upsample": Two consecutive ConvTranspose1d in feature space, then
+          project to 3D.  Only supports T_patches=27 (27→81→243).
+          Falls back to one_step_upsample otherwise.
+        - "two_step_mix": ConvTranspose1d to intermediate resolution, project to 3D,
+          then linearly interpolate to full resolution.
+          T_patches=27: 27→81 (upsample) → head → 81→243 (interp)
+          T_patches=81: 81→162 (upsample) → head → 162→243 (interp)
+
+    Input:  (B, T_patches, J, hidden_size)
+    Output: (B, num_frame, J, out_channels)
+    """
+
+    SUPPORTED_MODES = (
+        'one_step_interp', 'one_step_upsample',
+        'two_step_upsample', 'two_step_mix',
+    )
+
+    # {T_patches: (intermediate_frames, stride1, stride2)}
+    TWO_STEP_UPSAMPLE_CFG = {
+        27: (81, 3, 3),  # 27 →(s=3)→ 81 →(s=3)→ 243
+    }
+
+    # {T_patches: (intermediate_frames, stride1)}
+    TWO_STEP_MIX_CFG = {
+        27: (81, 3),   # 27 →(s=3)→ 81  →(interp)→ 243
+        81: (162, 2),  # 81 →(s=2)→ 162 →(interp)→ 243
+    }
+
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9,
+                 hidden_size=512, out_channels=3, mode='one_step_interp'):
+        super().__init__()
+        assert mode in self.SUPPORTED_MODES, \
+            f"Unknown mode: {mode}. Must be one of {self.SUPPORTED_MODES}"
+
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        self.num_time_patches = num_frame // patch_size
+        self.mode = mode
+
+        # --- Determine effective mode (handle fallbacks) ---
+        self._effective_mode = mode
+
+        if mode == 'two_step_upsample' \
+                and self.num_time_patches not in self.TWO_STEP_UPSAMPLE_CFG:
+            print(f"[JointDecoder] two_step_upsample is not supported for "
+                  f"T_patches={self.num_time_patches}. "
+                  f"Falling back to one_step_upsample.")
+            self._effective_mode = 'one_step_upsample'
+
+        if mode == 'two_step_mix' \
+                and self.num_time_patches not in self.TWO_STEP_MIX_CFG:
+            print(f"[JointDecoder] two_step_mix is not supported for "
+                  f"T_patches={self.num_time_patches}. "
+                  f"Falling back to one_step_interp.")
+            self._effective_mode = 'one_step_interp'
+
+        # --- Build layers ---
+        if self._effective_mode == 'one_step_interp':
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, out_channels),
+            )
+
+        elif self._effective_mode == 'one_step_upsample':
+            self.temporal_upsample = nn.ConvTranspose1d(
+                in_channels=hidden_size,
+                out_channels=hidden_size,
+                kernel_size=patch_size,
+                stride=patch_size,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, out_channels),
+            )
+
+        elif self._effective_mode == 'two_step_upsample':
+            intermediate, s1, s2 = self.TWO_STEP_UPSAMPLE_CFG[self.num_time_patches]
+            self._intermediate = intermediate
+            self.temporal_upsample_1 = nn.ConvTranspose1d(
+                in_channels=hidden_size,
+                out_channels=hidden_size,
+                kernel_size=s1, stride=s1,
+            )
+            self.temporal_upsample_2 = nn.ConvTranspose1d(
+                in_channels=hidden_size,
+                out_channels=hidden_size,
+                kernel_size=s2, stride=s2,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, out_channels),
+            )
+
+        elif self._effective_mode == 'two_step_mix':
+            intermediate, s1 = self.TWO_STEP_MIX_CFG[self.num_time_patches]
+            self._intermediate = intermediate
+            self.temporal_upsample_1 = nn.ConvTranspose1d(
+                in_channels=hidden_size,
+                out_channels=hidden_size,
+                kernel_size=s1, stride=s1,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, out_channels),
+            )
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, J, hidden_size)
+
+        Returns:
+            poses_3d: (B, num_frame, J, out_channels)
+        """
+        B, T_patches, J, C = tokens.shape
+
+        if self._effective_mode == 'one_step_interp':
+            sparse = self.head(tokens)                    # (B, T_patches, J, out_ch)
+            sparse = rearrange(sparse, 'b t j c -> b (j c) t')
+            out = F.interpolate(sparse, size=self.num_frame,
+                                mode='linear', align_corners=True)
+            return rearrange(out, 'b (j c) t -> b t j c',
+                             j=J, c=self.out_channels)
+
+        if self._effective_mode == 'one_step_upsample':
+            x = rearrange(tokens, 'b t j c -> (b j) c t')
+            x = self.temporal_upsample(x)                 # (B*J, C, num_frame)
+            x = rearrange(x, '(b j) c t -> b t j c', b=B, j=J)
+            return self.head(x)
+
+        if self._effective_mode == 'two_step_upsample':
+            x = rearrange(tokens, 'b t j c -> (b j) c t')
+            x = self.temporal_upsample_1(x)               # (B*J, C, intermediate)
+            x = self.temporal_upsample_2(x)               # (B*J, C, num_frame)
+            x = rearrange(x, '(b j) c t -> b t j c', b=B, j=J)
+            return self.head(x)
+
+        # two_step_mix
+        x = rearrange(tokens, 'b t j c -> (b j) c t')
+        x = self.temporal_upsample_1(x)                   # (B*J, C, intermediate)
+        x = rearrange(x, '(b j) c t -> b t j c', b=B, j=J)
+        sparse = self.head(x)                             # (B, intermediate, J, out_ch)
+        sparse = rearrange(sparse, 'b t j c -> b (j c) t')
+        out = F.interpolate(sparse, size=self.num_frame,
+                            mode='linear', align_corners=True)
+        return rearrange(out, 'b (j c) t -> b t j c',
+                         j=J, c=self.out_channels)
 
 
 class DualGroupDecoder(nn.Module):
@@ -1502,6 +1892,132 @@ class HybridMixSTEWithJointConv(nn.Module):
         # Decode: (B, T_patches, 17, hidden_size) -> (B, T, 17, 3)
         x = self.decoder(joint_tokens)
 
+        return x
+
+
+class HybridJointWiseMixSTE(nn.Module):
+    """
+    Joint-wise MixSTE variant with temporal patching and unique per-joint projection.
+
+    Each joint is treated as an independent group during embedding, but the
+    transformer backbone mixes information across all joints and time patches.
+    """
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
+                 patch_size=9, use_normalized_graph=False, decoder_mode='simple',
+                 embed_mode='joint'):
+        super().__init__()
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        embed_dim = embed_dim_ratio
+        out_dim = 3
+
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.num_time_patches = num_frame // patch_size
+        self.block_depth = depth
+        self.decoder_mode = decoder_mode
+
+        self.embedder = HybridJointWiseEmbedder(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            in_channels=in_chans,
+            hidden_size=embed_dim_ratio,
+            use_normalized_graph=use_normalized_graph,
+            embed_mode=embed_mode,
+        )
+        self.embedder_norm = norm_layer(embed_dim_ratio)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        self.STEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)
+        ])
+
+        self.TTEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, comb=False)
+            for i in range(depth)
+        ])
+
+        self.Spatial_norm = norm_layer(embed_dim_ratio)
+        self.Temporal_norm = norm_layer(embed_dim)
+
+        if decoder_mode == 'simple':
+            self.decoder = SimpleJointDecoder(
+                num_frame=num_frame,
+                num_joints=num_joints,
+                patch_size=patch_size,
+                hidden_size=embed_dim_ratio,
+                out_channels=out_dim
+            )
+        elif decoder_mode in JointDecoder.SUPPORTED_MODES:
+            self.decoder = JointDecoder(
+                num_frame=num_frame,
+                num_joints=num_joints,
+                patch_size=patch_size,
+                hidden_size=embed_dim_ratio,
+                out_channels=out_dim,
+                mode=decoder_mode,
+            )
+        else:
+            raise ValueError(
+                f"Unknown decoder_mode: {decoder_mode}. "
+                f"Must be 'simple' or one of {JointDecoder.SUPPORTED_MODES}"
+            )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def ST_forward(self, x):
+        """Alternating spatial-temporal forward pass over joint-wise tokens."""
+        assert len(x.shape) == 4, "shape should be 4"
+        b, t, n, c = x.shape
+        assert n == self.num_joints, f"Expected {self.num_joints} joint tokens, got {n}"
+
+        for i in range(self.block_depth):
+            x = rearrange(x, 'b t n c -> (b t) n c')
+            x = self.STEblocks[i](x)
+            x = self.Spatial_norm(x)
+
+            x = rearrange(x, '(b t) n c -> (b n) t c', b=b, t=t)
+            x = self.TTEblocks[i](x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) t c -> b t n c', b=b, n=n)
+
+        return x
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input 2D poses of shape (B, T, J, 2)
+
+        Returns:
+            3D poses of shape (B, T, J, 3)
+        """
+        x = self.embedder(x)
+        x = self.embedder_norm(x)
+        x = self.pos_drop(x)
+        x = self.ST_forward(x)
+        x = self.decoder(x)
         return x
 
 
