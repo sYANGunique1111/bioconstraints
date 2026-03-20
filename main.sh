@@ -7,8 +7,8 @@
 KEYPOINTS="cpn_ft_h36m_dbb"
 # KEYPOINTS="gt"
 
-# Model selection: "mixste", "hot_mixste", "hot_mixste_multi", or "h2ot_mixste"
-MODEL="hot_mixste_multi"
+# Model selection: "mixste", "hybrid_jointwise_mixste", "hot_mixste", "hot_mixste_multi", or "h2ot_mixste"
+MODEL="hybrid_jointwise_mixste"
 
 args=(
     # Training settings
@@ -41,7 +41,10 @@ args=(
     "--num_joints" "17"
     
     # HybridPoseModel specific
-    "--patch_size" "3"
+    "--patch_size" "9"
+    # "--use_normalized_graph"
+    "--decoder_mode" "two_step_upsample"
+    "--embed_mode" "temporal"
     
     # Dropout settings  
     "--drop_rate" "0.0"
@@ -49,15 +52,15 @@ args=(
     "--drop_path_rate" "0.0"
     
     # Checkpoint settings
-    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/Thot_mixste_multi_cluster-prune_3layer-81_h5"
+    "--checkpoint" "/data/shuoyang67/checkpoint/NewPoseProject/hybrid_jointwise_mixste_patch9_two_step_upsample_temporal"
     
     # Disable data augmentation (optional)
     # "--no-data-augmentation"
     
     # DDP settings
     "--world_size" "1" 
-    "--master_port" "8502" 
-    "--master_addr" "127.0.0.1" 
+    "--master_port" "8500" 
+    "--master_addr" "127.0.0.1"
     "--reduce_rank" "0"
     
     # Other options
@@ -66,4 +69,4 @@ args=(
 )
 
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
-CUDA_VISIBLE_DEVICES="1" python main.py ${args[@]}
+CUDA_VISIBLE_DEVICES="0" python main.py ${args[@]}

@@ -27,13 +27,19 @@ def parse_args():
 
     # Model architecture
     parser.add_argument('--model', default='mixste', type=str,
-                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_multi, h2ot_mixste, h2ot_mixste_interp')
+                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, hybrid_jointwise_mixste, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_multi, h2ot_mixste, h2ot_mixste_interp')
     parser.add_argument('--embed_dim', default=512, type=int)
     parser.add_argument('--depth', default=8, type=int)
     parser.add_argument('--num_heads', default=8, type=int)
     parser.add_argument('--mlp_ratio', default=2., type=float)
     parser.add_argument('-nj', '--num_joints', default=17, type=int)
     parser.add_argument('--patch_size', default=9, type=int, help='Temporal patch size for HybridPoseModel')
+    parser.add_argument('--use_normalized_graph', action='store_true',
+                        help='Apply a fixed normalized H36M graph residual in HybridJointWiseMixSTE after joint-wise projection')
+    parser.add_argument('--decoder_mode', default='simple', type=str,
+                        help='Decoder mode for HybridJointWiseMixSTE: simple, one_step_interp, one_step_upsample, two_step_upsample, two_step_mix')
+    parser.add_argument('--embed_mode', default='joint', type=str, choices=['joint', 'temporal'],
+                        help='Embedding orientation for HybridJointWiseMixSTE: joint (per-joint projection) or temporal (per-time-patch projection)')
     parser.add_argument('--drop_rate', default=0.0, type=float)
     parser.add_argument('--attn_drop_rate', default=0.0, type=float)
     parser.add_argument('--drop_path_rate', default=0.2, type=float)
