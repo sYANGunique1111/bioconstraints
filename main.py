@@ -24,7 +24,13 @@ from common.arguments import parse_args
 from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
 from common.loss import mpjpe, p_mpjpe
-from models.mixste import MixSTE2, HybridMixSTE, HybridMixSTEV2, HybridMixSTEWithJointConv
+from models.mixste import (
+    MixSTE2,
+    HybridMixSTE,
+    HybridMixSTEV2,
+    HybridMixSTEWithJointConv,
+    HybridJointWiseMixSTE,
+)
 from models.hot.mixste import HOTMixSTE, HOTMixSTEMultiHypothesis, H2OTMixSTE, H2OTMixSTEInterp
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
 from models.efficiency_models import TwoStageGroupedPoseModel, TwoStagePatchedPoseModel
@@ -326,6 +332,26 @@ def runner(rank, args, train_data, test_data):
             mlp_ratio=args.mlp_ratio,
             drop_rate=args.drop_rate,
             patch_size=args.patch_size
+        ).cuda()
+    elif args.model == 'hybrid_jointwise_mixste':
+        model_pos = HybridJointWiseMixSTE(
+            num_frame=args.number_of_frames,
+            num_joints=args.num_joints,
+            in_chans=2,
+            embed_dim_ratio=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            qkv_bias=True,
+            qk_scale=None,
+            drop_rate=args.drop_rate,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_path_rate=args.drop_path_rate,
+            norm_layer=None,
+            patch_size=args.patch_size,
+            use_normalized_graph=args.use_normalized_graph,
+            decoder_mode=args.decoder_mode,
+            embed_mode=args.embed_mode,
         ).cuda()
     elif args.model == 'two_stage_grouped':
         model_pos = TwoStageGroupedPoseModel(

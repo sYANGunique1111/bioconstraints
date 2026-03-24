@@ -19,14 +19,14 @@ cd "${SCRIPT_DIR}"
 
 # Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
-CHECKPOINT_DIR="biomech_mixste_cpn_h36m_L1-loss_0-10-0(rectified)"
+CHECKPOINT_DIR="biomech_mixste_cpn_h36m_L1-loss_0-005-10(rectified)"
 
 # Runtime defaults
 # COOP: gpu:4090, 110 GB RAM/node
 # FARM: gpu:a100, 366 GB RAM/node
 PARTITION="COOP"
 GPU_TYPE=""
-NODELIST=""
+NODELIST="ETROCOOP01"
 GPUS=2
 CPUS_PER_TASK=8
 MEMORY="24G"
@@ -166,8 +166,8 @@ TRAIN_ARGS=(
     "--attn_drop_rate" "0.0"
     "--drop_path_rate" "0.0"
     "--weight_bone" "0.0"
-    "--weight_symmetry" "10.0"
-    "--weight_angle" "0.0"
+    "--weight_symmetry" "0.005"
+    "--weight_angle" "10.0"
     "--checkpoint" "checkpoints/${CHECKPOINT_DIR}"
     "--world_size" "${GPUS}"
     "--master_port" "${MASTER_PORT}"

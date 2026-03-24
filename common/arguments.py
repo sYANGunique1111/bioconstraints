@@ -38,7 +38,7 @@ def parse_args():
                         help='Apply a fixed normalized H36M graph residual in HybridJointWiseMixSTE after joint-wise projection')
     parser.add_argument('--decoder_mode', default='simple', type=str,
                         help='Decoder mode for HybridJointWiseMixSTE: simple, one_step_interp, one_step_upsample, two_step_upsample, two_step_mix')
-    parser.add_argument('--embed_mode', default='joint', type=str, choices=['joint', 'temporal'],
+    parser.add_argument('--embed_mode', default='joint', type=str, choices=['joint', 'temporal', 'shared'],
                         help='Embedding orientation for HybridJointWiseMixSTE: joint (per-joint projection) or temporal (per-time-patch projection)')
     parser.add_argument('--drop_rate', default=0.0, type=float)
     parser.add_argument('--attn_drop_rate', default=0.0, type=float)

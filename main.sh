@@ -20,22 +20,25 @@ cd "${SCRIPT_DIR}"
 
 # Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
-MODEL="hybrid_joint_conv"
-CHECKPOINT_DIR="test"
+MODEL="hybrid_jointwise_mixste"
+CHECKPOINT_DIR="hybrid_jointwise_mixste_h36m_cpn_one_step_upsample_(linear)joint_patch3"
+DECODER_MODE="one_step_upsample"
+EMBED_MODE="joint"
+PATCH_SIZE="3"
 
 # Runtime defaults (conservative and server-friendly)
 # COOP: gpu:4090, 110 GB RAM/node
 # FARM: gpu:a100, 366 GB RAM/node
-PARTITION="COOP"
+PARTITION="FARM"
 GPU_TYPE=""          # Auto-set from partition if not provided.
 NODELIST=""
 GPUS=1               # Number of GPUs requested. Also used as world_size.
 CPUS_PER_TASK=8      # CPU threads available to each training process.
-MEMORY="48G"         # Total memory for the job.
-TIME_LIMIT="08:00:00"
+MEMORY="20G"         # Total memory for the job.
+TIME_LIMIT="20:00:00"
 JOB_NAME="bioconstraints-train"
 SLURM_LOG_DIR="${SCRIPT_DIR}/checkpoints/${CHECKPOINT_DIR}"
-MASTER_PORT="8501"
+MASTER_PORT="8500"
 MODULE_PYTORCH="PyTorch/2.1.2-foss-2023a-CUDA-12.1.1"
 MODULE_EINOPS="einops/0.7.0-GCCcore-12.3.0"
 MODULE_TIMM="timm/1.0.3-foss-2023a-CUDA-12.1.1"
@@ -165,7 +168,9 @@ TRAIN_ARGS=(
     "--num_heads" "8"
     "--mlp_ratio" "2"
     "--num_joints" "17"
-    "--patch_size" "1"
+    "--patch_size" "${PATCH_SIZE}"
+    "--decoder_mode" "${DECODER_MODE}"
+    "--embed_mode" "${EMBED_MODE}"
     "--drop_rate" "0.0"
     "--attn_drop_rate" "0.0"
     "--drop_path_rate" "0.0"

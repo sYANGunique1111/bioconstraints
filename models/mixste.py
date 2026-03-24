@@ -819,21 +819,28 @@ class HybridJointSemanticEmbedder(nn.Module):
 
 class HybridJointWiseEmbedder(nn.Module):
     """
-    Patch embedder with a unique projection per joint OR per temporal patch.
+    Patch embedder with a unique projection per joint, per temporal patch,
+    or a shared convolution-style projection across all joints and patches.
 
     embed_mode='joint'  (default):
-        Weight shape (J, patch_dim, hidden_size).  Each joint has its own
-        projection, shared across all time patches.
-        einsum: 'btjp,jph->btjh'
+        Uses one Linear(patch_dim, hidden_size) per joint, shared across all
+        time patches, matching the singleton-group implementation style used by
+        HybridMixSTEEmbedder.
 
     embed_mode='temporal':
         Weight shape (T_patches, patch_dim, hidden_size).  Each time-patch
         position has its own projection, shared across all joints.
         einsum: 'btjp,tph->btjh'
 
+    embed_mode='shared':
+        Uses the same shared Conv2d-style projection as the joint-only path in
+        HybridJointSemanticEmbedder. A single kernel of shape
+        (hidden_size, in_channels, patch_size, 1) is shared across all joints
+        and all temporal patch positions.
+
     Output shape: (B, T_patches, num_joints, hidden_size)
     """
-    SUPPORTED_EMBED_MODES = ('joint', 'temporal')
+    SUPPORTED_EMBED_MODES = ('joint', 'temporal', 'shared')
 
     def __init__(self, num_frame=243, num_joints=17, patch_size=9, in_channels=2,
                  hidden_size=512, bias=True, use_normalized_graph=False,
@@ -853,16 +860,29 @@ class HybridJointWiseEmbedder(nn.Module):
         self.embed_mode = embed_mode
 
         if embed_mode == 'joint':
-            # (J, patch_dim, hidden_size) — one projection per joint
-            self.joint_weight = nn.Parameter(torch.empty(num_joints, self.patch_dim, hidden_size))
-        else:  # 'temporal'
+            # One projection per joint, matching singleton-group HybridMixSTEEmbedder.
+            self.joint_projs = nn.ModuleList([
+                nn.Linear(self.patch_dim, hidden_size, bias=bias)
+                for _ in range(num_joints)
+            ])
+        elif embed_mode == 'temporal':
             # (T_patches, patch_dim, hidden_size) — one projection per time-patch
             self.temporal_weight = nn.Parameter(torch.empty(self.num_time_patches, self.patch_dim, hidden_size))
+        else:  # 'shared'
+            self.shared_conv = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=hidden_size,
+                kernel_size=(patch_size, 1),
+                stride=(patch_size, 1),
+                padding=0,
+                bias=bias
+            )
         if bias:
-            if embed_mode == 'joint':
-                self.joint_bias = nn.Parameter(torch.zeros(num_joints, hidden_size))
-            else:  # 'temporal'
+            if embed_mode == 'temporal':
                 self.temporal_bias = nn.Parameter(torch.zeros(self.num_time_patches, hidden_size))
+            else:
+                self.register_parameter('joint_bias', None)
+                self.register_parameter('temporal_bias', None)
         else:
             self.register_parameter('joint_bias', None)
             self.register_parameter('temporal_bias', None)
@@ -883,13 +903,15 @@ class HybridJointWiseEmbedder(nn.Module):
 
     def reset_parameters(self):
         if self.embed_mode == 'joint':
-            trunc_normal_(self.joint_weight, std=.02)
-            if self.joint_bias is not None:
-                nn.init.constant_(self.joint_bias, 0)
-        else:  # 'temporal'
+            pass
+        elif self.embed_mode == 'temporal':
             trunc_normal_(self.temporal_weight, std=.02)
             if self.temporal_bias is not None:
                 nn.init.constant_(self.temporal_bias, 0)
+        else:  # 'shared'
+            trunc_normal_(self.shared_conv.weight, std=.02)
+            if self.shared_conv.bias is not None:
+                nn.init.constant_(self.shared_conv.bias, 0)
 
     def _create_sinusoidal_pe(self, num_positions, dim):
         """Create fixed sinusoidal positional embeddings."""
@@ -932,18 +954,25 @@ class HybridJointWiseEmbedder(nn.Module):
         P_t = self.patch_size
         T_patches = T // P_t
 
-        x = x.view(B, T_patches, P_t, J, C)
-        x = x.permute(0, 1, 3, 2, 4).contiguous()
-        x = x.view(B, T_patches, J, self.patch_dim)
+        if self.embed_mode == 'shared':
+            x_conv = x.permute(0, 3, 1, 2)
+            conv_out = self.shared_conv(x_conv)
+            joint_tokens = conv_out.permute(0, 2, 3, 1)
+        else:
+            x = x.view(B, T_patches, P_t, J, C)
+            x = x.permute(0, 1, 3, 2, 4).contiguous()
+            x = x.view(B, T_patches, J, self.patch_dim)
 
-        if self.embed_mode == 'joint':
-            joint_tokens = torch.einsum('btjp,jph->btjh', x, self.joint_weight)
-            if self.joint_bias is not None:
-                joint_tokens = joint_tokens + self.joint_bias.unsqueeze(0).unsqueeze(0)
-        else:  # 'temporal'
-            joint_tokens = torch.einsum('btjp,tph->btjh', x, self.temporal_weight)
-            if self.temporal_bias is not None:
-                joint_tokens = joint_tokens + self.temporal_bias.unsqueeze(0).unsqueeze(2)
+            if self.embed_mode == 'joint':
+                joint_tokens = []
+                for j_idx in range(J):
+                    token = self.joint_projs[j_idx](x[:, :, j_idx, :])
+                    joint_tokens.append(token)
+                joint_tokens = torch.stack(joint_tokens, dim=2)
+            else:  # 'temporal'
+                joint_tokens = torch.einsum('btjp,tph->btjh', x, self.temporal_weight)
+                if self.temporal_bias is not None:
+                    joint_tokens = joint_tokens + self.temporal_bias.unsqueeze(0).unsqueeze(2)
 
         if self.use_normalized_graph:
             graph_tokens = torch.einsum('ij,btjh->btih', self.normalized_joint_graph, joint_tokens)
@@ -1588,112 +1617,6 @@ class CrossAttentionDecoder(nn.Module):
         predictions = predictions.view(B, T, J, C_out)
         
         return predictions
-
-
-class DualGroupDecoderV2(nn.Module):
-    """
-    Simplified Dual-Group Decoder V2 with flattened tokens and learnable weight.
-    
-    Key simplifications from V1:
-    - Flatten tokens before prediction
-    - Both joint and semantic groups predict ALL 17 joints
-    - Single learnable weight for combination (instead of fixed 0.5/0.5)
-    
-    Architecture:
-    1. Flatten joint tokens: (B, T_patches, 17, C) → (B, T_patches, 17*C)
-    2. Flatten semantic tokens: (B, T_patches, 5, C) → (B, T_patches, 5*C)
-    3. Joint head: predicts all 17 joints
-    4. Semantic head: predicts all 17 joints
-    5. Combine: α * joint_pred + (1-α) * semantic_pred (α learnable)
-    
-    Input: (B, T_patches, J + num_groups, hidden_size)
-    Output: (B, T, J, out_channels)
-    
-    Args:
-        num_frame: Total number of frames
-        num_joints: Number of joints (17 for H36M)
-        patch_size: Temporal patch size
-        hidden_size: Hidden dimension
-        out_channels: Output channels (3 for 3D)
-        num_groups: Number of semantic groups (default: 5)
-        init_weight: Initial value for learnable weight (default: 0.5)
-    """
-    def __init__(self, num_frame=243, num_joints=17, patch_size=9, hidden_size=512,
-                 out_channels=3, num_groups=5, init_weight=0.5):
-        super().__init__()
-        self.num_frame = num_frame
-        self.num_joints = num_joints
-        self.patch_size = patch_size
-        self.hidden_size = hidden_size
-        self.out_channels = out_channels
-        self.num_groups = num_groups
-        self.num_time_patches = num_frame // patch_size
-        
-        # Flattened dimensions
-        joint_flatten_dim = num_joints * hidden_size  # 17 * 512 = 8704
-        semantic_flatten_dim = num_groups * hidden_size  # 5 * 512 = 2560
-        
-        # Output dimension: all joints, all frames in patch
-        output_dim = num_joints * patch_size * out_channels  # 17 * 9 * 3 = 459
-        
-        # Joint prediction head (from flattened joint tokens)
-        self.joint_head = nn.Sequential(
-            nn.LayerNorm(joint_flatten_dim),
-            nn.Linear(joint_flatten_dim, output_dim)
-        )
-        
-        # Semantic prediction head (from flattened semantic tokens)
-        self.semantic_head = nn.Sequential(
-            nn.LayerNorm(semantic_flatten_dim),
-            nn.Linear(semantic_flatten_dim, output_dim)
-        )
-        
-        # Learnable combination weight (initialized to init_weight)
-        # final = alpha * joint + (1 - alpha) * semantic
-        self.alpha = nn.Parameter(torch.tensor(init_weight), requires_grad=False)
-    
-    def forward(self, tokens):
-        """
-        Args:
-            tokens: (B, T_patches, J + num_groups, hidden_size)
-        
-        Returns:
-            poses_3d: (B, T, J, out_channels)
-        """
-        B, T_patches, P, C = tokens.shape
-        J = self.num_joints
-        P_t = self.patch_size
-        C_out = self.out_channels
-        T = self.num_frame
-        
-        assert P == J + self.num_groups, \
-            f"Expected {J + self.num_groups} tokens, got {P}"
-        
-        # Split tokens
-        joint_tokens = tokens[:, :, :J, :]  # (B, T_patches, 17, C)
-        semantic_tokens = tokens[:, :, J:, :]  # (B, T_patches, num_groups, C)
-        
-        # === Step 1: Flatten tokens ===
-        joint_flat = joint_tokens.reshape(B, T_patches, -1)  # (B, T_patches, 17*C)
-        semantic_flat = semantic_tokens.reshape(B, T_patches, -1)  # (B, T_patches, 5*C)
-        
-        # === Step 2: Predict from flattened tokens ===
-        joint_preds = self.joint_head(joint_flat)  # (B, T_patches, 17*P_t*C_out)
-        semantic_preds = self.semantic_head(semantic_flat)  # (B, T_patches, 17*P_t*C_out)
-        
-        # === Step 3: Reshape to (B, T, J, C_out) ===
-        joint_preds = joint_preds.reshape(B, T_patches, J, P_t, C_out)
-        joint_preds = joint_preds.reshape(B, T, J, C_out)
-        
-        semantic_preds = semantic_preds.reshape(B, T_patches, J, P_t, C_out)
-        semantic_preds = semantic_preds.reshape(B, T, J, C_out)
-        
-        # === Step 4: Learnable weighted combination ===
-        # Clamp alpha to [0, 1] for stability
-        alpha = torch.sigmoid(self.alpha)  # Ensure alpha ∈ (0, 1)
-        final_preds = alpha * joint_preds + (1 - alpha) * semantic_preds
-        
-        return final_preds
 
 
 class HybridMixSTEWithJointConv(nn.Module):
