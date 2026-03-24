@@ -823,9 +823,9 @@ class HybridJointWiseEmbedder(nn.Module):
     or a shared convolution-style projection across all joints and patches.
 
     embed_mode='joint'  (default):
-        Uses one Linear(patch_dim, hidden_size) per joint, shared across all
-        time patches, matching the singleton-group implementation style used by
-        HybridMixSTEEmbedder.
+        Weight shape (J, patch_dim, hidden_size).  Each joint has its own
+        projection, shared across all time patches.
+        einsum: 'btjp,jph->btjh'
 
     embed_mode='temporal':
         Weight shape (T_patches, patch_dim, hidden_size).  Each time-patch
@@ -860,11 +860,8 @@ class HybridJointWiseEmbedder(nn.Module):
         self.embed_mode = embed_mode
 
         if embed_mode == 'joint':
-            # One projection per joint, matching singleton-group HybridMixSTEEmbedder.
-            self.joint_projs = nn.ModuleList([
-                nn.Linear(self.patch_dim, hidden_size, bias=bias)
-                for _ in range(num_joints)
-            ])
+            # (J, patch_dim, hidden_size) — one projection per joint
+            self.joint_weight = nn.Parameter(torch.empty(num_joints, self.patch_dim, hidden_size))
         elif embed_mode == 'temporal':
             # (T_patches, patch_dim, hidden_size) — one projection per time-patch
             self.temporal_weight = nn.Parameter(torch.empty(self.num_time_patches, self.patch_dim, hidden_size))
@@ -878,7 +875,9 @@ class HybridJointWiseEmbedder(nn.Module):
                 bias=bias
             )
         if bias:
-            if embed_mode == 'temporal':
+            if embed_mode == 'joint':
+                self.joint_bias = nn.Parameter(torch.zeros(num_joints, hidden_size))
+            elif embed_mode == 'temporal':
                 self.temporal_bias = nn.Parameter(torch.zeros(self.num_time_patches, hidden_size))
             else:
                 self.register_parameter('joint_bias', None)
@@ -903,7 +902,9 @@ class HybridJointWiseEmbedder(nn.Module):
 
     def reset_parameters(self):
         if self.embed_mode == 'joint':
-            pass
+            trunc_normal_(self.joint_weight, std=.02)
+            if self.joint_bias is not None:
+                nn.init.constant_(self.joint_bias, 0)
         elif self.embed_mode == 'temporal':
             trunc_normal_(self.temporal_weight, std=.02)
             if self.temporal_bias is not None:
@@ -964,11 +965,9 @@ class HybridJointWiseEmbedder(nn.Module):
             x = x.view(B, T_patches, J, self.patch_dim)
 
             if self.embed_mode == 'joint':
-                joint_tokens = []
-                for j_idx in range(J):
-                    token = self.joint_projs[j_idx](x[:, :, j_idx, :])
-                    joint_tokens.append(token)
-                joint_tokens = torch.stack(joint_tokens, dim=2)
+                joint_tokens = torch.einsum('btjp,jph->btjh', x, self.joint_weight)
+                if self.joint_bias is not None:
+                    joint_tokens = joint_tokens + self.joint_bias.unsqueeze(0).unsqueeze(0)
             else:  # 'temporal'
                 joint_tokens = torch.einsum('btjp,tph->btjh', x, self.temporal_weight)
                 if self.temporal_bias is not None:

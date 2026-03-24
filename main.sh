@@ -21,9 +21,9 @@ cd "${SCRIPT_DIR}"
 # Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
 MODEL="hybrid_jointwise_mixste"
-CHECKPOINT_DIR="hybrid_jointwise_mixste_h36m_cpn_one_step_upsample_(linear)joint_patch3"
-DECODER_MODE="one_step_upsample"
-EMBED_MODE="joint"
+CHECKPOINT_DIR="hybrid_jointwise_mixste_h36m_cpn_two_step_mix_shared_patch3"
+DECODER_MODE="two_step_mix"
+EMBED_MODE="shared"
 PATCH_SIZE="3"
 
 # Runtime defaults (conservative and server-friendly)
