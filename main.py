@@ -23,15 +23,24 @@ from torch.utils.data.distributed import DistributedSampler
 from common.arguments import parse_args
 from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
-from common.loss import mpjpe, p_mpjpe
+from common.loss import fweighted_mpjpe, mpjpe, p_mpjpe
 from models.mixste import (
     MixSTE2,
     HybridJointWiseMixSTE,
+    PreservedHybridJointWiseMixSTE,
     HybridMixSTE,
     HybridMixSTEV2,
     HybridMixSTEWithJointConv,
 )
-from models.hot.mixste import HOTMixSTE, HOTMixSTEMultiHypothesis, H2OTMixSTE, H2OTMixSTEInterp
+from models.hot.mixste import (
+    HOTMixSTE,
+    HOTMixSTEChunkedCompression,
+    HOTMixSTEChunkedCompressionMultiStep,
+    HOTMixSTEMultiHypothesis,
+    HOTMixSTEPreservedQuery,
+    H2OTMixSTE,
+    H2OTMixSTEInterp,
+)
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
 from models.efficiency_models import TwoStageGroupedPoseModel, TwoStagePatchedPoseModel
 
@@ -40,6 +49,12 @@ args = None
 
 # Global wandb run (for cleanup)
 wandb_run = None
+
+
+LOSS_FNS = {
+    'mpjpe': mpjpe,
+    'fweighted_mpjpe': fweighted_mpjpe,
+}
 
 
 def safe_torch_save(obj, path, max_retries=3):
@@ -168,6 +183,7 @@ def runner(rank, args, train_data, test_data):
     dist.init_process_group(backend='nccl', init_method='env://', world_size=args.world_size, rank=rank)
 
     lr = args.learning_rate
+    train_loss_fn = LOSS_FNS[args.loss_type]
 
     # Girdle groups
     # joint_groups = [
@@ -352,6 +368,27 @@ def runner(rank, args, train_data, test_data):
             use_normalized_graph=args.use_normalized_graph,
             decoder_mode=args.decoder_mode,
             embed_mode=args.embed_mode,
+            norm_mode=args.norm_mode,
+        ).cuda()
+    elif args.model == 'preserved_hybrid_jointwise_mixste':
+        model_pos = PreservedHybridJointWiseMixSTE(
+            num_frame=args.number_of_frames,
+            num_joints=args.num_joints,
+            in_chans=2,
+            embed_dim_ratio=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            qkv_bias=True,
+            qk_scale=None,
+            drop_rate=args.drop_rate,
+            attn_drop_rate=args.attn_drop_rate,
+            drop_path_rate=args.drop_path_rate,
+            norm_layer=None,
+            patch_size=args.patch_size,
+            use_normalized_graph=args.use_normalized_graph,
+            embed_mode=args.embed_mode,
+            decoder_mode=args.decoder_mode,
         ).cuda()
     elif args.model == 'two_stage_grouped':
         model_pos = TwoStageGroupedPoseModel(
@@ -389,6 +426,36 @@ def runner(rank, args, train_data, test_data):
         hot_args.layer_index = args.layer_index
         hot_args.pruning_strategy = args.pruning_strategy
         model_pos = HOTMixSTE(hot_args).cuda()
+    elif args.model == 'hot_mixste_chunked':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.use_chunk_ortho_loss = args.use_chunk_ortho_loss
+        hot_args.lambda_chunk_ortho = args.lambda_chunk_ortho
+        hot_args.decoder_mode = getattr(args, 'decoder_mode', 'cross_attention')
+        hot_args.chunking_scheme = args.chunking_scheme
+        hot_args.use_pairwise_flow = args.use_pairwise_flow
+        model_pos = HOTMixSTEChunkedCompression(hot_args).cuda()
+    elif args.model == 'hot_mixste_chunked_multistep':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.use_chunk_ortho_loss = args.use_chunk_ortho_loss
+        hot_args.lambda_chunk_ortho = args.lambda_chunk_ortho
+        hot_args.decoder_mode = getattr(args, 'decoder_mode', 'cross_attention')
+        hot_args.chunking_scheme = args.chunking_scheme
+        hot_args.use_pairwise_flow = args.use_pairwise_flow
+        hot_args.hierarchical_layer_indices = args.hierarchical_layer_indices
+        hot_args.hierarchical_token_nums = args.hierarchical_token_nums
+        model_pos = HOTMixSTEChunkedCompressionMultiStep(hot_args).cuda()
     elif args.model == 'hot_mixste_multi':
         hot_args = type('HotArgs', (), {})()
         hot_args.frames = args.number_of_frames
@@ -398,10 +465,19 @@ def runner(rank, args, train_data, test_data):
         hot_args.layer_index = args.layer_index
         hot_args.pruning_strategy = args.pruning_strategy
         hot_args.num_hypotheses = args.num_hypotheses
-        hot_args.symmetry_floor = args.symmetry_floor
-        hot_args.joint_angle_floor = args.joint_angle_floor
-        hot_args.score_eps = args.score_eps
+        hot_args.lambda_sym = getattr(args, 'lambda_sym', 1.0)
+        hot_args.lambda_angle = getattr(args, 'lambda_angle', 1.0)
         model_pos = HOTMixSTEMultiHypothesis(hot_args).cuda()
+    elif args.model == 'hot_mixste_preserved_query':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        hot_args.decoder_mode = args.decoder_mode
+        model_pos = HOTMixSTEPreservedQuery(hot_args).cuda()
     elif args.model == 'h2ot_mixste':
         hot_args = type('HotArgs', (), {})()
         hot_args.frames = args.number_of_frames
@@ -493,6 +569,7 @@ def runner(rank, args, train_data, test_data):
         train_sampler.set_epoch(epoch)
         start_time = time.time()
         epoch_loss_train = 0
+        epoch_loss_train_ortho = 0
         N = 0
 
         model_pos.train()
@@ -509,13 +586,22 @@ def runner(rank, args, train_data, test_data):
                 predicted_3d, pre_interp_3d, kept_indices = model_pos(inputs_2d, return_pre_interp=True)
                 gather_idx = kept_indices[:, :, None, None].expand(-1, -1, inputs_3d.shape[2], inputs_3d.shape[3])
                 target_3d_pruned = torch.gather(inputs_3d, 1, gather_idx)
-                loss = mpjpe(pre_interp_3d, target_3d_pruned)
+                mpjpe_loss = train_loss_fn(pre_interp_3d, target_3d_pruned)
+                ortho_loss = None
             else:
                 predicted_3d = model_pos(inputs_2d)
-                loss = mpjpe(predicted_3d, inputs_3d)
+                mpjpe_loss = train_loss_fn(predicted_3d, inputs_3d)
+                ortho_loss = getattr(model_pos.module, 'latest_chunk_ortho_loss', None)
+
+            loss = mpjpe_loss
+            if ortho_loss is not None and getattr(model_pos.module, 'lambda_chunk_ortho', 0.0) > 0.0:
+                loss = loss + model_pos.module.lambda_chunk_ortho * ortho_loss
+
             loss.backward()
 
-            epoch_loss_train += inputs_3d.shape[0] * inputs_3d.shape[1] * loss.item()
+            epoch_loss_train += inputs_3d.shape[0] * inputs_3d.shape[1] * mpjpe_loss.item()
+            if ortho_loss is not None:
+                epoch_loss_train_ortho += inputs_3d.shape[0] * inputs_3d.shape[1] * ortho_loss.item()
             N += inputs_3d.shape[0] * inputs_3d.shape[1]
 
             optimizer.step()
@@ -573,6 +659,8 @@ def runner(rank, args, train_data, test_data):
                     "best_valid_loss": min_loss,
                     "time_per_epoch": elapsed
                 }
+                if args.use_chunk_ortho_loss:
+                    log_dict["train_chunk_ortho_loss"] = epoch_loss_train_ortho / N
                 
                 # Log gradients at 3 points: beginning, middle, end
                 if epoch in gradient_epochs:

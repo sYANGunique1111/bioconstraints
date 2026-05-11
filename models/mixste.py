@@ -1361,6 +1361,77 @@ class JointDecoder(nn.Module):
                          j=J, c=self.out_channels)
 
 
+class CrossAttentionRecoveryDecoder(nn.Module):
+    """
+    Decoder using learnable query tokens and cross-attention to recover full
+    temporal resolution from compressed patch tokens.
+
+    Adapted from HOT-MixSTE's ``_recover_output`` strategy:
+    1. Broadcast learnable ``x_token`` (one per output frame) to the batch.
+    2. Cross-attention: Q = x_token, K = V = encoder output.
+    3. Residual: recovered = x_token + cross_attn(...).
+    4. Prediction head: LayerNorm + Linear → 3D coordinates.
+
+    Input:  (B, T_patches, J, hidden_size)
+    Output: (B, num_frame, J, out_channels)
+    """
+
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9,
+                 hidden_size=512, out_channels=3, num_heads=8,
+                 attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        self.num_time_patches = num_frame // patch_size
+
+        # Learnable query tokens – one per output frame
+        self.x_token = nn.Parameter(torch.zeros(1, num_frame, hidden_size))
+
+        # Cross-attention: Q from x_token, K=V from encoder
+        self.cross_attn = CrossAttention(
+            dim=hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            qk_scale=None,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+
+        # Prediction head
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, out_channels),
+        )
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, J, hidden_size)
+
+        Returns:
+            poses_3d: (B, num_frame, J, out_channels)
+        """
+        B, T_patches, J, C = tokens.shape
+
+        # Reshape to per-joint sequences: (B*J, T_patches, C)
+        source = rearrange(tokens, 'b t j c -> (b j) t c')
+
+        # Broadcast learnable queries: (1, T_full, C) → (B*J, T_full, C)
+        x_token = self.x_token.expand(B * J, -1, -1)
+
+        # Cross-attention recovery with residual
+        recovered = x_token + self.cross_attn(x_token, source)  # (B*J, T_full, C)
+
+        # Back to (B, T_full, J, C)
+        recovered = rearrange(recovered, '(b j) t c -> b t j c', b=B, j=J)
+
+        # Project to 3D
+        return self.head(recovered)  # (B, num_frame, J, out_channels)
+
+
 class DualGroupDecoder(nn.Module):
     """
     Dual-Group Decoder that combines predictions from both joint and semantic tokens.
@@ -1906,7 +1977,7 @@ class HybridJointWiseMixSTE(nn.Module):
                  num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
                  patch_size=9, use_normalized_graph=False, decoder_mode='simple',
-                 embed_mode='joint'):
+                 embed_mode='joint', norm_mode=None):
         super().__init__()
 
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
@@ -1919,6 +1990,7 @@ class HybridJointWiseMixSTE(nn.Module):
         self.num_time_patches = num_frame // patch_size
         self.block_depth = depth
         self.decoder_mode = decoder_mode
+        self.norm_mode = norm_mode
 
         self.embedder = HybridJointWiseEmbedder(
             num_frame=num_frame,
@@ -1929,7 +2001,15 @@ class HybridJointWiseMixSTE(nn.Module):
             use_normalized_graph=use_normalized_graph,
             embed_mode=embed_mode,
         )
-        self.embedder_norm = norm_layer(embed_dim_ratio)
+
+        if norm_mode == 'joint':
+            # Per-joint learnable affine after parameter-free layer_norm
+            # (same pattern as HybridMixSTE gamma/beta)
+            self.gamma = nn.Parameter(torch.ones(1, 1, num_joints, embed_dim_ratio))
+            self.beta = nn.Parameter(torch.zeros(1, 1, num_joints, embed_dim_ratio))
+        else:
+            self.embedder_norm = norm_layer(embed_dim_ratio)
+
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
@@ -1970,10 +2050,21 @@ class HybridJointWiseMixSTE(nn.Module):
                 out_channels=out_dim,
                 mode=decoder_mode,
             )
+        elif decoder_mode == 'cross_attn_recovery':
+            self.decoder = CrossAttentionRecoveryDecoder(
+                num_frame=num_frame,
+                num_joints=num_joints,
+                patch_size=patch_size,
+                hidden_size=embed_dim_ratio,
+                out_channels=out_dim,
+                num_heads=num_heads,
+                attn_drop=attn_drop_rate,
+                proj_drop=drop_rate,
+            )
         else:
             raise ValueError(
                 f"Unknown decoder_mode: {decoder_mode}. "
-                f"Must be 'simple' or one of {JointDecoder.SUPPORTED_MODES}"
+                f"Must be 'simple', 'cross_attn_recovery', or one of {JointDecoder.SUPPORTED_MODES}"
             )
 
         self.apply(self._init_weights)
@@ -2014,11 +2105,239 @@ class HybridJointWiseMixSTE(nn.Module):
             3D poses of shape (B, T, J, 3)
         """
         x = self.embedder(x)
-        x = self.embedder_norm(x)
+        if self.norm_mode == 'joint':
+            x = F.layer_norm(x, (x.shape[-1],), weight=None, bias=None, eps=1e-6)
+            x = x * self.gamma + self.beta
+        else:
+            x = self.embedder_norm(x)
         x = self.pos_drop(x)
         x = self.ST_forward(x)
         x = self.decoder(x)
         return x
+
+
+class PreservedHybridJointWiseMixSTE(nn.Module):
+    """
+    Dual-branch model combining temporal-patched processing with full-resolution
+    preserved query generation.
+
+    Branch 1 (Pruned): HybridJointWiseMixSTE-style pipeline
+        - HybridJointWiseEmbedder → temporal patching → (B, T_patches, J, C)
+        - Alternating spatial-temporal transformer blocks (depth layers)
+        - ConvTranspose1d upsampling → (B, T, J, C)
+
+    Branch 2 (Full Temporal / Preserved Query): PreservedQueryModel-style pipeline
+        - Linear embedding + learnable PEs at full temporal resolution
+        - 1 spatial block + 1 temporal block
+        - Output: (B, T, J, C)
+
+    Fusion:
+        - default: LayerNorm both branches → adaptive weighted sum → shared head
+        - cross_attention: LayerNorm both branches → cross-attention(pruned, preserved)
+          with residual on the pruned branch → shared head
+    """
+    def __init__(self, num_frame=243, num_joints=17, in_chans=2, embed_dim_ratio=512, depth=8,
+                 num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
+                 patch_size=9, use_normalized_graph=False,
+                 embed_mode='joint', decoder_mode='adaptive_sum'):
+        super().__init__()
+
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        embed_dim = embed_dim_ratio
+        out_dim = 3
+
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.num_time_patches = num_frame // patch_size
+        self.block_depth = depth
+        self.norm_mode = embed_mode
+        self.decoder_mode = decoder_mode
+
+        # ===== Branch 1: Pruned (HybridJointWiseMixSTE) =====
+        self.embedder = HybridJointWiseEmbedder(
+            num_frame=num_frame,
+            num_joints=num_joints,
+            patch_size=patch_size,
+            in_channels=in_chans,
+            hidden_size=embed_dim_ratio,
+            use_normalized_graph=use_normalized_graph,
+            embed_mode=embed_mode,
+        )
+
+        if self.norm_mode == 'joint':
+            self.gamma = nn.Parameter(torch.ones(1, 1, num_joints, embed_dim_ratio))
+            self.beta = nn.Parameter(torch.zeros(1, 1, num_joints, embed_dim_ratio))
+        else:
+            self.embedder_norm = norm_layer(embed_dim_ratio)
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+
+        self.STEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)
+        ])
+
+        self.TTEblocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, comb=False)
+            for i in range(depth)
+        ])
+
+        self.Spatial_norm = norm_layer(embed_dim_ratio)
+        self.Temporal_norm = norm_layer(embed_dim)
+
+        # Upsampling for pruned branch: T_patches → T
+        self.temporal_upsample = nn.ConvTranspose1d(
+            in_channels=embed_dim,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+        )
+
+        # ===== Branch 2: Full Temporal (Preserved Query) =====
+        self.query_Spatial_patch_to_embedding = nn.Linear(in_chans, embed_dim)
+        self.query_Spatial_pos_embed = nn.Parameter(torch.zeros(1, num_joints, embed_dim))
+        self.query_Temporal_pos_embed = nn.Parameter(torch.zeros(1, num_frame, embed_dim))
+        self.query_pos_drop = nn.Dropout(p=drop_rate)
+
+        self.query_STEblock = Block(
+            dim=embed_dim_ratio, num_heads=num_heads, mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+            attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer,
+        )
+        self.query_TTEblock = Block(
+            dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+            attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer, comb=False,
+        )
+        self.query_Spatial_norm = norm_layer(embed_dim)
+        self.query_Temporal_norm = norm_layer(embed_dim)
+
+        # ===== Fusion =====
+        self.encoded_norm = norm_layer(embed_dim)
+        self.query_out_norm = norm_layer(embed_dim)
+        if self.decoder_mode == 'cross_attention':
+            self.register_parameter('alpha', None)
+            self.fusion_cross_attn = CrossAttention(
+                dim=embed_dim,
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                attn_drop=attn_drop_rate,
+                proj_drop=drop_rate,
+            )
+        else:
+            self.alpha = nn.Parameter(torch.tensor(0.5))
+            self.fusion_cross_attn = None
+
+        # Shared head
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, out_dim),
+        )
+
+        # Initialize weights
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def _encode_pruned(self, x):
+        """Pruned branch: embed → norm → pos_drop → ST blocks → (B, T_patches, J, C)."""
+        x = self.embedder(x)
+        if self.norm_mode == 'joint':
+            x = F.layer_norm(x, (x.shape[-1],), weight=None, bias=None, eps=1e-6)
+            x = x * self.gamma + self.beta
+        else:
+            x = self.embedder_norm(x)
+        x = self.pos_drop(x)
+        x = self._ST_forward(x)
+        return x
+
+    def _ST_forward(self, x):
+        """Alternating spatial-temporal forward pass over joint-wise tokens."""
+        b, t, n, c = x.shape
+        for i in range(self.block_depth):
+            x = rearrange(x, 'b t n c -> (b t) n c')
+            x = self.STEblocks[i](x)
+            x = self.Spatial_norm(x)
+
+            x = rearrange(x, '(b t) n c -> (b n) t c', b=b, t=t)
+            x = self.TTEblocks[i](x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) t c -> b t n c', b=b, n=n)
+        return x
+
+    def _upsample_encoded(self, x):
+        """Upsample pruned branch from (B, T_patches, J, C) to (B, T, J, C)."""
+        B, T_patches, J, C = x.shape
+        x = rearrange(x, 'b t j c -> (b j) c t')
+        x = self.temporal_upsample(x)  # (B*J, C, T)
+        x = rearrange(x, '(b j) c t -> b t j c', b=B, j=J)
+        return x
+
+    def _generate_query(self, x):
+        """Full temporal branch: embed → 1 STE + 1 TTE → (B, T, J, C)."""
+        b, f, n, _ = x.shape
+        x = rearrange(x, 'b f n c -> (b f) n c')
+        x = self.query_Spatial_patch_to_embedding(x)
+        x += self.query_Spatial_pos_embed
+        x = self.query_pos_drop(x)
+        x = self.query_STEblock(x)
+        x = self.query_Spatial_norm(x)
+        x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+        x += self.query_Temporal_pos_embed
+        x = self.query_pos_drop(x)
+        x = self.query_TTEblock(x)
+        x = self.query_Temporal_norm(x)
+        x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        return x
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input 2D poses of shape (B, T, J, 2)
+
+        Returns:
+            3D poses of shape (B, T, J, 3)
+        """
+        # Branch 1: Pruned (patched temporal)
+        encoded = self._encode_pruned(x)            # (B, T_patches, J, C)
+        encoded = self._upsample_encoded(encoded)   # (B, T, J, C)
+
+        # Branch 2: Full temporal (preserved query)
+        query = self._generate_query(x)             # (B, T, J, C)
+
+        # Fusion at full temporal resolution after upsampling the pruned branch.
+        encoded = self.encoded_norm(encoded)
+        query = self.query_out_norm(query)
+        if self.decoder_mode == 'cross_attention':
+            b, t, j, c = encoded.shape
+            encoded_flat = encoded.reshape(b * t, j, c)
+            query_flat = query.reshape(b * t, j, c)
+            fused = encoded_flat + self.fusion_cross_attn(encoded_flat, query_flat)
+            fused = fused.reshape(b, t, j, c)
+        else:
+            fused = self.alpha * encoded + (1 - self.alpha) * query
+
+        # Shared head
+        output = self.head(fused)                   # (B, T, J, 3)
+        return output
 
 
 class HybridMixSTE(nn.Module):
