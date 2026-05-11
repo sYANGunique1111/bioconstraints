@@ -20,16 +20,16 @@ cd "${SCRIPT_DIR}"
 
 # Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
-MODEL="hybrid_jointwise_mixste"
-CHECKPOINT_DIR="hybrid_jointwise_mixste_h36m_cpn_two_step_mix_shared_patch3"
-DECODER_MODE="two_step_mix"
-EMBED_MODE="shared"
+MODEL="hot_mixste_preserved_query"
+CHECKPOINT_DIR="hot_mixste_preserved_query_h36m_cpn_token_pruning_learned_patch3"
+DECODER_MODE="one_step_interp"
+EMBED_MODE="joint"
 PATCH_SIZE="3"
 
 # Runtime defaults (conservative and server-friendly)
 # COOP: gpu:4090, 110 GB RAM/node
 # FARM: gpu:a100, 366 GB RAM/node
-PARTITION="FARM"
+PARTITION="COOP"
 GPU_TYPE=""          # Auto-set from partition if not provided.
 NODELIST=""
 GPUS=1               # Number of GPUs requested. Also used as world_size.
@@ -168,6 +168,7 @@ TRAIN_ARGS=(
     "--num_heads" "8"
     "--mlp_ratio" "2"
     "--num_joints" "17"
+    "--pruning_strategy" "learned"
     "--patch_size" "${PATCH_SIZE}"
     "--decoder_mode" "${DECODER_MODE}"
     "--embed_mode" "${EMBED_MODE}"

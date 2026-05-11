@@ -1,0 +1,42 @@
+Running frame-wise decoder ablation with python3 on ETROCOOP01
+Traceback (most recent call last):
+  File "/apps/goldencove/software/SciPy-bundle/2023.07-gfbf-2023a/lib/python3.11/site-packages/numpy/core/__init__.py", line 23, in <module>
+    from . import multiarray
+  File "/apps/goldencove/software/SciPy-bundle/2023.07-gfbf-2023a/lib/python3.11/site-packages/numpy/core/multiarray.py", line 10, in <module>
+    from . import overrides
+  File "/apps/goldencove/software/SciPy-bundle/2023.07-gfbf-2023a/lib/python3.11/site-packages/numpy/core/overrides.py", line 8, in <module>
+    from numpy.core._multiarray_umath import (
+        add_docstring,  _get_implementing_args, _ArrayFunctionDispatcher)
+ModuleNotFoundError: No module named 'numpy.core._multiarray_umath'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/FARM/syangb/projects/bioconstraints/ablation_framewise_decoder.py", line 16, in <module>
+    import numpy as np
+  File "/apps/goldencove/software/SciPy-bundle/2023.07-gfbf-2023a/lib/python3.11/site-packages/numpy/__init__.py", line 139, in <module>
+    from . import core
+  File "/apps/goldencove/software/SciPy-bundle/2023.07-gfbf-2023a/lib/python3.11/site-packages/numpy/core/__init__.py", line 49, in <module>
+    raise ImportError(msg)
+ImportError: 
+
+IMPORTANT: PLEASE READ THIS FOR ADVICE ON HOW TO SOLVE THIS ISSUE!
+
+Importing the numpy C-extensions failed. This error can happen for
+many reasons, often due to issues with your setup or how NumPy was
+installed.
+
+We have compiled some common reasons and troubleshooting tips at:
+
+    https://numpy.org/devdocs/user/troubleshooting-importerror.html
+
+Please note and check the following:
+
+  * The Python version is: Python3.13 from "/FARM/syangb/miniconda3/bin/python3"
+  * The NumPy version is: "1.25.1"
+
+and make sure that they are the versions you expect.
+Please carefully study the documentation linked above for further help.
+
+Original error was: No module named 'numpy.core._multiarray_umath'
+

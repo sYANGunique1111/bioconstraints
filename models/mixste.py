@@ -1090,6 +1090,82 @@ class HybridMixSTEDecoder(nn.Module):
         return output
 
 
+class SimpleCenterInterpolationDecoder(nn.Module):
+    """
+    Simplified center-interpolation decoder using MixSTE2-style token head.
+
+    Structure mirrors GroupCenterInterpolationDecoder:
+      1) Predict per-patch center poses from tokens.
+      2) Interpolate center sequence over time to recover all frames.
+    """
+    def __init__(self, num_frame=243, num_joints=17, patch_size=9, hidden_size=512,
+                 out_channels=3, joint_groups=None, align_corners=False):
+        super().__init__()
+        if patch_size % 2 == 0:
+            raise ValueError(f"patch_size must be odd, got {patch_size}")
+        if num_frame % patch_size != 0:
+            raise ValueError(
+                f"num_frame ({num_frame}) must be divisible by patch_size ({patch_size})"
+            )
+
+        if joint_groups is None:
+            joint_groups = [[i] for i in range(num_joints)]
+
+        self.num_frame = num_frame
+        self.num_joints = num_joints
+        self.patch_size = patch_size
+        self.hidden_size = hidden_size
+        self.out_channels = out_channels
+        self.joint_groups = joint_groups
+        self.num_groups = len(joint_groups)
+        self.align_corners = align_corners
+        self.num_time_patches = num_frame // patch_size
+
+        if self.num_joints != 17 or self.num_groups != 17:
+            raise ValueError(
+                "SimpleCenterInterpolationDecoder requires num_joints=17 and num_groups=17, "
+                f"got num_joints={self.num_joints}, num_groups={self.num_groups}"
+            )
+
+        # Same style as MixSTE2 regression head.
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 3)
+        )
+
+    def forward(self, tokens):
+        """
+        Args:
+            tokens: (B, T_patches, num_groups, hidden_size)
+        Returns:
+            poses_3d: (B, T, num_joints, 3)
+        """
+        B, T_patches, num_groups, _ = tokens.shape
+        if T_patches != self.num_time_patches:
+            raise ValueError(
+                f"Expected T_patches={self.num_time_patches}, got {T_patches}"
+            )
+        if num_groups != self.num_groups:
+            raise ValueError(
+                f"Expected num_groups={self.num_groups}, got {num_groups}"
+            )
+
+        center_poses = self.head(tokens)  # (B, T_patches, 17, 3)
+
+        interp_in = center_poses.permute(0, 2, 3, 1).reshape(
+            B, self.num_joints * self.out_channels, T_patches
+        )
+        interp_out = F.interpolate(
+            interp_in,
+            size=self.num_frame,
+            mode="linear",
+            align_corners=self.align_corners
+        )
+        poses_3d = interp_out.view(B, self.num_joints, self.out_channels, self.num_frame)
+        poses_3d = poses_3d.permute(0, 3, 1, 2).contiguous()
+        return poses_3d
+
+
 class SimpleJointDecoder(nn.Module):
     """
     Simple decoder for per-joint tokens with temporal upsampling.
@@ -1266,7 +1342,7 @@ class JointDecoder(nn.Module):
     }
 
     def __init__(self, num_frame=243, num_joints=17, patch_size=9,
-                 hidden_size=512, out_channels=3, mode='one_step_interp'):
+                 hidden_size=512, out_channels=3, mode='one_step_interp', align_corners=False):
         super().__init__()
         assert mode in self.SUPPORTED_MODES, \
             f"Unknown mode: {mode}. Must be one of {self.SUPPORTED_MODES}"
@@ -1278,6 +1354,7 @@ class JointDecoder(nn.Module):
         self.out_channels = out_channels
         self.num_time_patches = num_frame // patch_size
         self.mode = mode
+        self.align_corners = align_corners
 
         # --- Determine effective mode (handle fallbacks) ---
         self._effective_mode = mode
@@ -1360,7 +1437,7 @@ class JointDecoder(nn.Module):
             sparse = self.head(tokens)                    # (B, T_patches, J, out_ch)
             sparse = rearrange(sparse, 'b t j c -> b (j c) t')
             out = F.interpolate(sparse, size=self.num_frame,
-                                mode='linear', align_corners=True)
+                                mode='linear', align_corners=self.align_corners)
             return rearrange(out, 'b (j c) t -> b t j c',
                              j=J, c=self.out_channels)
 
@@ -1384,7 +1461,7 @@ class JointDecoder(nn.Module):
         sparse = self.head(x)                             # (B, intermediate, J, out_ch)
         sparse = rearrange(sparse, 'b t j c -> b (j c) t')
         out = F.interpolate(sparse, size=self.num_frame,
-                            mode='linear', align_corners=True)
+                            mode='linear', align_corners=self.align_corners)
         return rearrange(out, 'b (j c) t -> b t j c',
                          j=J, c=self.out_channels)
 
@@ -1828,7 +1905,7 @@ class HybridJointWiseMixSTE(nn.Module):
                  num_heads=8, mlp_ratio=2., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.2, norm_layer=None,
                  patch_size=9, use_normalized_graph=False, decoder_mode='simple',
-                 embed_mode='joint'):
+                 embed_mode='joint', align_corners=False):
         super().__init__()
 
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
@@ -1891,6 +1968,7 @@ class HybridJointWiseMixSTE(nn.Module):
                 hidden_size=embed_dim_ratio,
                 out_channels=out_dim,
                 mode=decoder_mode,
+                align_corners=align_corners
             )
         else:
             raise ValueError(

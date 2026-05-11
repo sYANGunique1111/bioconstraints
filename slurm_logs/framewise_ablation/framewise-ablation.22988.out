@@ -1,0 +1,4 @@
+Running frame-wise decoder ablation with python3 on ETROCOOP01
+Loading dataset once for all checkpoint evaluations...
+Evaluating /FARM/syangb/projects/bioconstraints/checkpoints/hybrid_jointwise_mixste_h36m_cpn_one_step_interp_shared_patch3 | decoder_mode=one_step_interp | align_corners=True
+Saved frame-wise metrics to /FARM/syangb/projects/bioconstraints/framewise_ablation/hybrid_jointwise_mixste_h36m_cpn_one_step_interp_shared_patch3 | mean MPJPE=45.073 mm | mean PA-MPJPE=35.963 mm

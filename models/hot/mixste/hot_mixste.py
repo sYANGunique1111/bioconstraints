@@ -354,6 +354,71 @@ class Model(nn.Module):
         return x
 
 
+class PreservedQueryModel(Model):
+    def __init__(self, args):
+        super().__init__(args)
+        # This variant does not decode from a learned query token.
+        self.register_parameter("x_token", None)
+
+    def _encode_tokens(self, x):
+        b, f, n, _ = x.shape
+
+        x = rearrange(x, 'b f n c  -> (b f) n c')
+        x = self.Spatial_patch_to_embedding(x)
+        x += self.Spatial_pos_embed
+        x = self.pos_drop(x)
+        recover_query = rearrange(x, '(b f) n c -> b f n c', b=b, f=f)
+        x = self.STEblocks[0](x)
+        x = self.Spatial_norm(x)
+
+        x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+        x += self.Temporal_pos_embed
+        x = self.pos_drop(x)
+        x = self.TTEblocks[0](x)
+        x = self.Temporal_norm(x)
+
+        x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        for i in range(1, self.block_depth):
+            if i == self.layer_index:
+                if self.pruning_strategy == "cluster":
+                    x = self._cluster_temporal_tokens(x)
+                elif self.pruning_strategy == "learned":
+                    x = self._learned_prune_temporal_tokens(x)
+                else:
+                    raise ValueError(f"Unsupported HOT pruning_strategy: {self.pruning_strategy}")
+
+                x = rearrange(x, 'b f n c -> (b n) f c')
+                x += self.pos_embed_token
+                x = rearrange(x, '(b n) f c -> b f n c', n=n)
+
+            x = rearrange(x, 'b f n c -> (b f) n c')
+            steblock = self.STEblocks[i]
+            tteblock = self.TTEblocks[i]
+
+            x = steblock(x)
+            x = self.Spatial_norm(x)
+            x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
+
+            x = tteblock(x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) f c -> b f n c', n=n)
+
+        return x, recover_query
+
+    def _recover_output(self, x, recover_query):
+        b, f, n, c = recover_query.shape
+        x = rearrange(x, 'b f n c -> (b n) f c')
+        recover_query = rearrange(recover_query, 'b f n c -> (b n) f c')
+        recover_query = recover_query + self.cross_attention(recover_query, x, x)
+        recover_query = rearrange(recover_query, '(b n) f c -> b f n c', b=b, n=n)
+        return self.head(recover_query)
+
+    def forward(self, x):
+        x, recover_query = self._encode_tokens(x)
+        x = self._recover_output(x, recover_query)
+        return x
+
+
 class MultiHypothesisModel(Model):
     def __init__(self, args):
         super().__init__(args)
@@ -426,5 +491,3 @@ if __name__ == '__main__':
     print('macs: ', macs/1000000, 'params: ', params/1000000)
     macs, params = clever_format([macs*2, params], "%.3f")
     print(macs, params)
-
-

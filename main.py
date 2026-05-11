@@ -31,7 +31,13 @@ from models.mixste import (
     HybridMixSTEWithJointConv,
     HybridJointWiseMixSTE,
 )
-from models.hot.mixste import HOTMixSTE, HOTMixSTEMultiHypothesis, H2OTMixSTE, H2OTMixSTEInterp
+from models.hot.mixste import (
+    HOTMixSTE,
+    HOTMixSTEMultiHypothesis,
+    HOTMixSTEPreservedQuery,
+    H2OTMixSTE,
+    H2OTMixSTEInterp,
+)
 from models.pose_embedder import HybridPoseModel2, HybridPoseModel3, HybridPoseModel3_2
 from models.efficiency_models import TwoStageGroupedPoseModel, TwoStagePatchedPoseModel
 
@@ -402,6 +408,15 @@ def runner(rank, args, train_data, test_data):
         hot_args.joint_angle_floor = args.joint_angle_floor
         hot_args.score_eps = args.score_eps
         model_pos = HOTMixSTEMultiHypothesis(hot_args).cuda()
+    elif args.model == 'hot_mixste_preserved_query':
+        hot_args = type('HotArgs', (), {})()
+        hot_args.frames = args.number_of_frames
+        hot_args.channel = args.embed_dim
+        hot_args.n_joints = args.num_joints
+        hot_args.token_num = args.token_num
+        hot_args.layer_index = args.layer_index
+        hot_args.pruning_strategy = args.pruning_strategy
+        model_pos = HOTMixSTEPreservedQuery(hot_args).cuda()
     elif args.model == 'h2ot_mixste':
         hot_args = type('HotArgs', (), {})()
         hot_args.frames = args.number_of_frames

@@ -27,7 +27,7 @@ def parse_args():
 
     # Model architecture
     parser.add_argument('--model', default='mixste', type=str,
-                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, hybrid_jointwise_mixste, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_multi, h2ot_mixste, h2ot_mixste_interp')
+                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, hybrid_jointwise_mixste, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_multi, hot_mixste_preserved_query, h2ot_mixste, h2ot_mixste_interp')
     parser.add_argument('--embed_dim', default=512, type=int)
     parser.add_argument('--depth', default=8, type=int)
     parser.add_argument('--num_heads', default=8, type=int)
@@ -61,7 +61,7 @@ def parse_args():
                         help='Comma-separated recovered token counts at each recovery stage (e.g. "109,243")')
     parser.add_argument('--pruning_strategy', default='cluster', type=str,
                         help='HOT/H2OT pruning strategy: cluster, learned, motion, sampler')
-    parser.add_argument('--num_hypotheses', default=4, type=int,
+    parser.add_argument('--num_hypotheses', default=5, type=int,
                         help='Number of output hypotheses for hot_mixste_multi')
     parser.add_argument('--symmetry_floor', default=1e-3, type=float,
                         help='Positive floor added before symmetry-loss normalization in hot_mixste_multi')
