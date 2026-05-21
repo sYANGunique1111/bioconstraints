@@ -2,6 +2,7 @@ import sys
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 from timm.layers import DropPath
 from einops import rearrange, repeat
@@ -128,7 +129,7 @@ class Cross_Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x_1, x_2, x_3):
+    def forward(self, x_1, x_2, x_3, attn_mask=None):
         B, N, C = x_1.shape
         B, N_1, C = x_3.shape
 
@@ -137,6 +138,8 @@ class Cross_Attention(nn.Module):
         v = self.linear_v(x_3).reshape(B, N_1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
         
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        if attn_mask is not None:
+            attn = attn.masked_fill(~attn_mask, torch.finfo(attn.dtype).min)
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -354,41 +357,707 @@ class Model(nn.Module):
         return x
 
 
-class PreservedQueryModel(Model):
+# --- Old ChunkedCompressionModel (commented out, replaced by new version below) ---
+# class ChunkedCompressionModel(Model):
+#     """HOT variant that compresses temporal embeddings by learnable chunk averaging."""
+#
+#     def __init__(self, args):
+#         super().__init__(args)
+#
+#         if self.token_num <= 0 or self.token_num > args.frames:
+#             raise ValueError(f"token_num must be in [1, {args.frames}] for chunked compression.")
+#
+#         chunk_size = args.frames // self.token_num
+#         if chunk_size == 0:
+#             raise ValueError("token_num must be no larger than frames for chunked compression.")
+#
+#         self.chunk_size = chunk_size
+#         self.chunk_compress2_chunk_size = 9
+#         self.chunk_compress2_tokens_per_chunk = 3
+#
+#         if self.layer_index == 0:
+#             self.register_parameter('Temporal_pos_embed', None)
+#             self.chunk_compression_weights = nn.Parameter(
+#                 torch.full((1, self.token_num, chunk_size, 2), 1.0 / chunk_size)
+#             )
+#         else:
+#             self.chunk_compression_weights = nn.Parameter(
+#                 torch.full((1, self.token_num, chunk_size, args.channel), 1.0 / chunk_size)
+#             )
+
+#
+#         # compress2_num_chunks = math.ceil(args.frames / self.chunk_compress2_chunk_size)
+#         # compress2_weight_dim = 2 if self.layer_index == 0 else args.channel
+#         # self.chunk_compression_weights2 = nn.Parameter(
+#         #     torch.full(
+#         #         (
+#         #             1,
+#         #             compress2_num_chunks,
+#         #             self.chunk_compress2_tokens_per_chunk,
+#         #             self.chunk_compress2_chunk_size,
+#         #             compress2_weight_dim,
+#         #         ),
+#         #         1.0 / self.chunk_compress2_chunk_size,
+#         #     )
+#         # )
+#         self.use_chunk_ortho_loss = getattr(args, "use_chunk_ortho_loss", False)
+#         self.lambda_chunk_ortho = getattr(args, "lambda_chunk_ortho", 0.0)
+#         self.latest_chunk_ortho_loss = None
+#
+#     def _chunk_compress(self, x, weights):
+#         b, f, n, _ = x.shape
+#         if self.token_num <= 0 or self.token_num > f:
+#             raise ValueError(f"token_num must be in [1, {f}] for chunked compression.")
+#
+#         chunk_size = f // self.token_num
+#         usable_f = self.token_num * chunk_size
+#         if chunk_size != self.chunk_size or weights.shape[2] != chunk_size:
+#             raise ValueError(
+#                 f"Expected chunk_size={self.chunk_size} but got chunk_size={chunk_size}."
+#             )
+#
+#         x = x[:, :usable_f]
+#         x = rearrange(x, 'b (k s) n c -> (b n) k s c', k=self.token_num, s=chunk_size)
+#         weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
+#         x = (x * weights).sum(dim=2)
+#         return rearrange(x, '(b n) k c -> b k n c', b=b, n=n)
+#
+#     # def _chunk_compress2(self, x, weights=None):
+#     #     ...  (already commented out)
+#
+#     def _compute_chunk_orthogonality_loss(self, x):
+#         if x.shape[1] <= 1:
+#             return x.new_zeros(())
+#
+#         tokens = rearrange(x, 'b f n c -> b n f c')
+#         tokens = F.normalize(tokens, p=2, dim=-1, eps=1e-6)
+#         sim = torch.matmul(tokens, tokens.transpose(-1, -2))
+#
+#         diag_mask = torch.eye(sim.shape[-1], device=sim.device, dtype=torch.bool)
+#         sim = sim.masked_fill(diag_mask.view(1, 1, sim.shape[-1], sim.shape[-1]), 0.0)
+#
+#         denom = x.shape[0] * x.shape[1] * x.shape[2] * max(x.shape[1] - 1, 1)
+#         return  (0.44 * (sim-0.5).square()).sum() / denom
+#
+#     def _encode_tokens(self, x):
+#         self.latest_chunk_ortho_loss = None
+#         b, f, n, _ = x.shape
+#
+#         if self.layer_index == 0:
+#             x = self._chunk_compress(x, self.chunk_compression_weights)
+#             f = x.shape[1]
+#
+#         x = rearrange(x, 'b f n c  -> (b f) n c')
+#         x = self.Spatial_patch_to_embedding(x)
+#         x += self.Spatial_pos_embed
+#         x = self.pos_drop(x)
+#         x = self.STEblocks[0](x)
+#         x = self.Spatial_norm(x)
+#
+#         x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+#         if self.layer_index == 0:
+#             x = x + self.pos_embed_token
+#         else:
+#             x = x +self.Temporal_pos_embed
+#         x = self.pos_drop(x)
+#         x = self.TTEblocks[0](x)
+#         x = self.Temporal_norm(x)
+#
+#         x = rearrange(x, '(b n) f c -> b f n c', n=n)
+#         if self.layer_index == 0 and self.use_chunk_ortho_loss:
+#             self.latest_chunk_ortho_loss = self._compute_chunk_orthogonality_loss(x)
+#         for i in range(1, self.block_depth):
+#             if i == self.layer_index:
+#                 x = self._chunk_compress(x, self.chunk_compression_weights)
+#                 if self.use_chunk_ortho_loss:
+#                     self.latest_chunk_ortho_loss = self._compute_chunk_orthogonality_loss(x)
+#                 x = rearrange(x, 'b f n c -> (b n) f c')
+#                 x = x + self.pos_embed_token
+#                 x = rearrange(x, '(b n) f c -> b f n c', n=n)
+#
+#             x = rearrange(x, 'b f n c -> (b f) n c')
+#             steblock = self.STEblocks[i]
+#             tteblock = self.TTEblocks[i]
+#
+#             x = steblock(x)
+#             x = self.Spatial_norm(x)
+#             x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
+#
+#             x = tteblock(x)
+#             x = self.Temporal_norm(x)
+#             x = rearrange(x, '(b n) f c -> b f n c', n=n)
+#
+#         return x
+# --- End of old ChunkedCompressionModel ---
+
+
+class ChunkedCompressionModel(Model):
+    """HOT variant that compresses temporal embeddings by learnable chunk averaging.
+
+    Supports multiple decoder modes for temporal recovery:
+      - 'cross_attention': (default) learnable x_token + cross-attention (original HOT).
+      - 'one_step_interp': project to 3D then linearly interpolate to full resolution.
+      - 'feature_interp_transform': linearly interpolate features to full resolution,
+            apply a learned affine feature transform, then project to 3D.
+      - 'feature_interp_attn': linearly interpolate features to full resolution,
+            apply temporal self-attention per joint, then project to 3D.
+      - 'feature_interp_affine_attn': linearly interpolate features to full resolution,
+            apply a learned affine feature transform, then temporal self-attention
+            per joint, then project to 3D.
+      - 'one_step_interp_cubic': project to 3D then bicubically interpolate to full resolution.
+      - 'one_step_upsample': ConvTranspose1d in feature space then project to 3D.
+      - 'two_step_upsample': two ConvTranspose1d stages then project to 3D.
+            Only for token_num=27 (27->81->243). Falls back to one_step_upsample.
+      - 'two_step_mix': ConvTranspose1d to intermediate, project to 3D, then interpolate.
+            For token_num=27 (27->81->243) or token_num=81 (81->162->243).
+            Falls back to one_step_interp.
+      - 'ut_insert_attention': scatter chunk tokens to chunk centers, fill the remaining
+            positions with learned UT placeholders, then run temporal self-attention.
+    """
+
+    SUPPORTED_DECODER_MODES = (
+        'cross_attention',
+        'one_step_interp', 'feature_interp_transform', 'feature_interp_attn', 'feature_interp_affine_attn',
+        'one_step_interp_cubic', 'one_step_upsample',
+        'two_step_upsample', 'two_step_mix', 'ut_insert_attention',
+    )
+
+    # {token_num: (intermediate_frames, stride1, stride2)}
+    TWO_STEP_UPSAMPLE_CFG = {
+        27: (81, 3, 3),  # 27 ->(s=3)-> 81 ->(s=3)-> 243
+    }
+
+    # {token_num: (intermediate_frames, stride1)}
+    TWO_STEP_MIX_CFG = {
+        27: (81, 3),   # 27 ->(s=3)-> 81  ->(interp)-> 243
+        81: (162, 2),  # 81 ->(s=2)-> 162 ->(interp)-> 243
+    }
+
     def __init__(self, args):
         super().__init__(args)
-        # This variant does not decode from a learned query token.
-        self.register_parameter("x_token", None)
+
+        # Chunked compression does not use learned token selection from the parent HOT model.
+        # Remove the inherited selector so DDP does not track permanently unused parameters.
+        if self.token_selector is not None:
+            del self.token_selector
+            self.token_selector = None
+
+        if self.token_num <= 0 or self.token_num > args.frames:
+            raise ValueError(f"token_num must be in [1, {args.frames}] for chunked compression.")
+
+        base_chunk_size = args.frames // self.token_num
+        if base_chunk_size == 0:
+            raise ValueError("token_num must be no larger than frames for chunked compression.")
+
+        self.chunking_scheme = getattr(args, "chunking_scheme", "even")
+        self.chunk_lengths = self._resolve_chunk_lengths(args.frames, self.token_num, self.chunking_scheme)
+        self.use_uneven_chunking = self.chunk_lengths is not None
+        self.preserve_boundary_chunks = self.chunking_scheme == "corner_aligned"
+
+        self.chunk_size = base_chunk_size
+        self.max_chunk_size = max(self.chunk_lengths) if self.use_uneven_chunking else base_chunk_size
+
+        if self.layer_index == 0:
+            self.register_parameter('Temporal_pos_embed', None)
+            self.chunk_compression_weights = nn.Parameter(
+                self._build_chunk_weight_init(2)
+            )
+        else:
+            self.chunk_compression_weights = nn.Parameter(
+                self._build_chunk_weight_init(args.channel)
+            )
+
+        if self.use_uneven_chunking:
+            chunk_lengths = torch.tensor(self.chunk_lengths, dtype=torch.long)
+            chunk_offsets = torch.cat(
+                [chunk_lengths.new_zeros(1), chunk_lengths.cumsum(dim=0)[:-1]],
+                dim=0,
+            )
+            self.chunk_offsets_list = chunk_offsets.tolist()
+            chunk_position_ids = torch.arange(self.max_chunk_size, dtype=torch.long).unsqueeze(0)
+            chunk_valid_mask = (chunk_position_ids < chunk_lengths.unsqueeze(1)).view(1, self.token_num, self.max_chunk_size, 1)
+            self.register_buffer("chunk_lengths_tensor", chunk_lengths, persistent=False)
+            self.register_buffer("chunk_offsets", chunk_offsets, persistent=False)
+            self.register_buffer("chunk_valid_mask", chunk_valid_mask, persistent=False)
+        else:
+            self.chunk_lengths_tensor = None
+            self.chunk_offsets = None
+            self.chunk_valid_mask = None
+            self.chunk_offsets_list = None
+
+        self.use_chunk_ortho_loss = getattr(args, "use_chunk_ortho_loss", False)
+        self.lambda_chunk_ortho = getattr(args, "lambda_chunk_ortho", 0.0)
+        self.latest_chunk_ortho_loss = None
+
+        # --- Pairwise temporal flow (parallel, non-cascading) ---
+        self.use_pairwise_flow = getattr(args, "use_pairwise_flow", False)
+        if self.use_pairwise_flow:
+            flow_dim = 2 if self.layer_index == 0 else args.channel
+            self.flow_proj = nn.Linear(flow_dim, flow_dim)
+            self.flow_gate = nn.Parameter(torch.full((1,), -5.0))  # sigmoid(-5) ≈ 0
+
+        # --- Decoder mode ---
+        embed_dim = args.channel
+        self.decoder_mode = getattr(args, "decoder_mode", "cross_attention")
+        assert self.decoder_mode in self.SUPPORTED_DECODER_MODES, \
+            f"Unknown decoder_mode: {self.decoder_mode}. Must be one of {self.SUPPORTED_DECODER_MODES}"
+        self.decoder_cross_pe = getattr(args, "decoder_cross_pe", "none")
+        if self.decoder_cross_pe not in ("none", "query", "query_key"):
+            raise ValueError(
+                f"Unknown decoder_cross_pe: {self.decoder_cross_pe}. Must be one of "
+                f"('none', 'query', 'query_key')."
+            )
+        self.decoder_cross_attn_local_radius = getattr(args, "decoder_cross_attn_local_radius", -1)
+        self.decoder_ut_depth = getattr(args, "decoder_ut_depth", 1)
+        self.decoder_ut_anchor_mode = getattr(args, "decoder_ut_anchor_mode", "chunk_center")
+        if self.decoder_ut_anchor_mode != "chunk_center":
+            raise ValueError(
+                f"Unknown decoder_ut_anchor_mode: {self.decoder_ut_anchor_mode}. Must be 'chunk_center'."
+            )
+
+        # Determine effective mode (handle fallbacks)
+        self._effective_decoder_mode = self.decoder_mode
+
+        if self.decoder_mode == 'two_step_upsample' \
+                and self.token_num not in self.TWO_STEP_UPSAMPLE_CFG:
+            print(f"[ChunkedCompressionModel] two_step_upsample not supported for "
+                  f"token_num={self.token_num}. Falling back to one_step_upsample.")
+            self._effective_decoder_mode = 'one_step_upsample'
+
+        if self.decoder_mode == 'two_step_mix' \
+                and self.token_num not in self.TWO_STEP_MIX_CFG:
+            print(f"[ChunkedCompressionModel] two_step_mix not supported for "
+                  f"token_num={self.token_num}. Falling back to one_step_interp.")
+            self._effective_decoder_mode = 'one_step_interp'
+
+        if self._effective_decoder_mode == 'ut_insert_attention' and self.use_uneven_chunking:
+            raise ValueError(
+                "decoder_mode='ut_insert_attention' currently supports chunking_scheme='even' only."
+            )
+
+        # Build decoder layers based on effective mode
+        if self._effective_decoder_mode == 'cross_attention':
+            # Parent already provides: self.x_token, self.cross_attention, self.head
+            if self.decoder_cross_pe in ("query", "query_key"):
+                self.register_buffer(
+                    "decoder_query_pos_embed",
+                    self._build_sinusoidal_pos_embed(self.recover_num, embed_dim),
+                    persistent=False,
+                )
+            else:
+                self.decoder_query_pos_embed = None
+
+            if self.decoder_cross_pe == "query_key":
+                self.register_buffer(
+                    "decoder_key_pos_embed",
+                    self._build_sinusoidal_pos_embed(self.token_num, embed_dim),
+                    persistent=False,
+                )
+            else:
+                self.decoder_key_pos_embed = None
+
+            if self.decoder_cross_attn_local_radius >= 0:
+                self.register_buffer(
+                    "decoder_local_attn_mask",
+                    self._build_decoder_local_attn_mask(
+                        self.recover_num,
+                        self.token_num,
+                        self.decoder_cross_attn_local_radius,
+                    ),
+                    persistent=False,
+                )
+            else:
+                self.decoder_local_attn_mask = None
+
+        elif self._effective_decoder_mode in (
+                'one_step_interp',
+                'feature_interp_transform',
+                'feature_interp_attn',
+                'feature_interp_affine_attn',
+                'one_step_interp_cubic',
+        ):
+            # Only need head (already inherited). Remove unused cross_attention/x_token.
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            if self._effective_decoder_mode == 'feature_interp_transform':
+                # Spline-inspired affine correction after interpolation: y = Wx + b.
+                self.feature_interp_transform = nn.Linear(embed_dim, embed_dim)
+            if self._effective_decoder_mode == 'feature_interp_affine_attn':
+                self.feature_interp_affine = nn.Linear(embed_dim, embed_dim)
+            if self._effective_decoder_mode in ('feature_interp_attn', 'feature_interp_affine_attn'):
+                self.register_buffer(
+                    "feature_interp_attn_pos_embed",
+                    self._build_sinusoidal_pos_embed(self.recover_num, embed_dim),
+                    persistent=False,
+                )
+                self.feature_interp_attn_norm = nn.LayerNorm(embed_dim)
+                self.feature_interp_attn = Attention(
+                    embed_dim,
+                    num_heads=8,
+                    qkv_bias=True,
+                    qk_scale=None,
+                    attn_drop=0.0,
+                    proj_drop=0.0,
+                )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+
+        elif self._effective_decoder_mode == 'one_step_upsample':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            self.temporal_upsample = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=base_chunk_size, stride=base_chunk_size,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+
+        elif self._effective_decoder_mode == 'two_step_upsample':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            _, s1, s2 = self.TWO_STEP_UPSAMPLE_CFG[self.token_num]
+            self.temporal_upsample_1 = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=s1, stride=s1,
+            )
+            self.temporal_upsample_2 = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=s2, stride=s2,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+
+        elif self._effective_decoder_mode == 'two_step_mix':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            self._intermediate, s1 = self.TWO_STEP_MIX_CFG[self.token_num]
+            self.temporal_upsample_1 = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=s1, stride=s1,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+
+        elif self._effective_decoder_mode == 'ut_insert_attention':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            self.register_buffer(
+                "ut_anchor_indices_tensor",
+                self._build_ut_anchor_indices(
+                    self.recover_num,
+                    self.token_num,
+                    self.chunk_size,
+                    self.decoder_ut_anchor_mode,
+                ),
+                persistent=False,
+            )
+            self.decoder_ut_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            self.register_buffer(
+                "decoder_ut_pos_embed",
+                self._build_sinusoidal_pos_embed(self.recover_num, embed_dim),
+                persistent=False,
+            )
+            mlp_hidden_dim = args.channel * 2
+            norm_layer = partial(nn.LayerNorm, eps=1e-6)
+            self.decoder_ut_blocks = nn.ModuleList([
+                Block(
+                    dim=embed_dim,
+                    num_heads=8,
+                    mlp_hidden_dim=mlp_hidden_dim,
+                    qkv_bias=True,
+                    qk_scale=None,
+                    drop=0.0,
+                    attn_drop=0.0,
+                    drop_path=0.0,
+                    norm_layer=norm_layer,
+                    depth=self.decoder_ut_depth,
+                )
+                for _ in range(self.decoder_ut_depth)
+            ])
+            self.decoder_ut_ffn_norm = nn.LayerNorm(embed_dim)
+            self.decoder_ut_ffn = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 2),
+                nn.GELU(),
+                nn.Dropout(0.0),
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.Dropout(0.0),
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+
+        if self._effective_decoder_mode != 'cross_attention':
+            self.decoder_query_pos_embed = None
+            self.decoder_key_pos_embed = None
+            self.decoder_local_attn_mask = None
+
+    @classmethod
+    def _resolve_chunk_lengths(cls, frames, token_num, chunking_scheme):
+        if chunking_scheme == "even":
+            return None
+        if chunking_scheme == "corner_aligned":
+            return cls._build_corner_aligned_chunk_lengths(frames, token_num)
+        raise ValueError(
+            f"Unknown chunking_scheme: {chunking_scheme}. Must be one of ('even', 'corner_aligned')."
+        )
+
+    @staticmethod
+    def _build_corner_aligned_chunk_lengths(frames, token_num):
+        if token_num < 2:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' requires token_num >= 2, but got {token_num}."
+            )
+        if frames < 2:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' requires frames >= 2, but got {frames}."
+            )
+
+        chunk_size = frames // token_num
+        if chunk_size == 0:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' requires token_num <= frames, but got "
+                f"frames={frames}, token_num={token_num}."
+            )
+
+        boundary_chunk_count = 2
+        boundary_frames = 2
+        regular_chunk_count = token_num - boundary_chunk_count
+        extra_large_chunk_count = frames - boundary_frames - chunk_size * regular_chunk_count
+
+        if extra_large_chunk_count < 0:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' produced a negative number of enlarged chunks for "
+                f"frames={frames}, token_num={token_num}."
+            )
+        if extra_large_chunk_count % 2 != 0:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' requires an even number of enlarged chunks, but got "
+                f"{extra_large_chunk_count} for frames={frames}, token_num={token_num}."
+            )
+        if extra_large_chunk_count > regular_chunk_count:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' requires {extra_large_chunk_count} enlarged chunks, "
+                f"but only {regular_chunk_count} non-boundary chunks are available."
+            )
+
+        large_chunks_per_side = extra_large_chunk_count // 2
+        regular_middle_chunk_count = regular_chunk_count - extra_large_chunk_count
+        chunk_lengths = (
+            [1]
+            + [chunk_size + 1] * large_chunks_per_side
+            + [chunk_size] * regular_middle_chunk_count
+            + [chunk_size + 1] * large_chunks_per_side
+            + [1]
+        )
+
+        if len(chunk_lengths) != token_num:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' generated {len(chunk_lengths)} chunks, expected {token_num}."
+            )
+        if sum(chunk_lengths) != frames:
+            raise ValueError(
+                f"chunking_scheme='corner_aligned' covers {sum(chunk_lengths)} frames, expected {frames}."
+            )
+        return chunk_lengths
+
+    def _build_chunk_weight_init(self, channel_dim):
+        if not self.use_uneven_chunking:
+            return torch.full((1, self.token_num, self.chunk_size, channel_dim), 1.0 / self.chunk_size)
+
+        weight_init = torch.zeros((1, self.token_num, self.max_chunk_size, channel_dim))
+        for chunk_idx, chunk_len in enumerate(self.chunk_lengths):
+            weight_init[:, chunk_idx, :chunk_len, :] = 1.0 / chunk_len
+        return weight_init
+
+    @staticmethod
+    def _build_sinusoidal_pos_embed(length, dim):
+        position = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim)
+        )
+        pos_embed = torch.zeros(1, length, dim, dtype=torch.float32)
+        pos_embed[0, :, 0::2] = torch.sin(position * div_term)
+        pos_embed[0, :, 1::2] = torch.cos(position * div_term[:pos_embed[0, :, 1::2].shape[-1]])
+        return pos_embed
+
+    def _build_decoder_local_attn_mask(recover_num, token_num, radius):
+        frame_pos = torch.arange(recover_num, dtype=torch.float32)
+        token_pos = frame_pos * (token_num - 1) / max(recover_num - 1, 1)
+        source_idx = torch.arange(token_num, dtype=torch.float32)
+        mask = (source_idx.view(1, token_num) - token_pos.view(recover_num, 1)).abs() <= float(radius)
+        return mask.view(1, 1, recover_num, token_num)
+
+    @staticmethod
+    def _build_ut_anchor_indices(recover_num, token_num, chunk_size, anchor_mode):
+        if anchor_mode != "chunk_center":
+            raise ValueError(f"Unsupported UT anchor mode: {anchor_mode}")
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
+        if token_num * chunk_size != recover_num:
+            raise ValueError(
+                "UT anchor construction requires even chunking with token_num * chunk_size == recover_num, "
+                f"but got token_num={token_num}, chunk_size={chunk_size}, recover_num={recover_num}."
+            )
+
+        starts = torch.arange(token_num, dtype=torch.long) * chunk_size
+        return starts + (chunk_size - 1) // 2
+
+    def _build_ut_dense_sequence(self, x):
+        bnj, token_num, c = x.shape
+        if token_num != self.token_num:
+            raise ValueError(f"Expected token_num={self.token_num}, got {token_num}.")
+
+        dense = self.decoder_ut_token.expand(bnj, self.recover_num, c).clone()
+        anchor_indices = self.ut_anchor_indices_tensor.to(device=x.device)
+        batch_idx = torch.arange(bnj, device=x.device).unsqueeze(1)
+        dense[batch_idx, anchor_indices.unsqueeze(0), :] = x
+
+        return dense + self.decoder_ut_pos_embed.to(device=x.device, dtype=x.dtype)
+
+    @staticmethod
+    def _temporal_resample(x, out_len, mode):
+        b, _, n, c = x.shape
+
+        if mode == "linear":
+            x = rearrange(x, 'b t n c -> b (n c) t')
+            out = F.interpolate(x, size=out_len, mode='linear', align_corners=True)
+            return rearrange(out, 'b (n c) t -> b t n c', n=n, c=c)
+
+        if mode == "cubic":
+            x = rearrange(x, 'b t n c -> b (n c) 1 t')
+            out = F.interpolate(x, size=(1, out_len), mode='bicubic', align_corners=True)
+            return rearrange(out, 'b (n c) 1 t -> b t n c', n=n, c=c)
+
+        raise ValueError(f"Unknown temporal resample mode: {mode}")
+
+    def _chunk_compress(self, x, weights):
+        b, f, n, _ = x.shape
+        if self.token_num <= 0 or self.token_num > f:
+            raise ValueError(f"token_num must be in [1, {f}] for chunked compression.")
+
+        if self.use_uneven_chunking:
+            return self._chunk_compress_uneven(x, weights)
+
+        chunk_size = f // self.token_num
+        usable_f = self.token_num * chunk_size
+        if chunk_size != self.chunk_size or weights.shape[2] != chunk_size:
+            raise ValueError(
+                f"Expected chunk_size={self.chunk_size} but got chunk_size={chunk_size}."
+            )
+
+        x = x[:, :usable_f]
+        x = rearrange(x, 'b (k s) n c -> (b n) k s c', k=self.token_num, s=chunk_size)
+        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
+        x = (x * weights).sum(dim=2)
+        return rearrange(x, '(b n) k c -> b k n c', b=b, n=n)
+
+    def _chunk_compress_uneven(self, x, weights):
+        b, f, n, _ = x.shape
+        if f != int(self.chunk_lengths_tensor.sum().item()):
+            raise ValueError(
+                f"Expected frames={int(self.chunk_lengths_tensor.sum().item())} for uneven chunking but got {f}."
+            )
+        if weights.shape[2] != self.max_chunk_size:
+            raise ValueError(
+                f"Expected max_chunk_size={self.max_chunk_size} but got {weights.shape[2]}."
+            )
+
+        chunked = x.new_zeros((b, self.token_num, self.max_chunk_size, n, x.shape[-1]))
+        for chunk_idx, (start, chunk_len) in enumerate(zip(self.chunk_offsets_list, self.chunk_lengths)):
+            chunked[:, chunk_idx, :chunk_len] = x[:, start:start + chunk_len]
+
+        chunked = rearrange(chunked, 'b k s n c -> (b n) k s c')
+        masked_weights = weights * self.chunk_valid_mask.to(dtype=weights.dtype)
+        masked_weights = masked_weights / (masked_weights.sum(dim=2, keepdim=True) + 1e-6)
+        compressed = (chunked * masked_weights).sum(dim=2)
+
+        if self.preserve_boundary_chunks:
+            compressed[:, 0] = chunked[:, 0, 0]
+            compressed[:, -1] = chunked[:, -1, 0]
+
+        return rearrange(compressed, '(b n) k c -> b k n c', b=b, n=n)
+
+    def _pairwise_temporal_flow(self, x):
+        """Parallel pairwise info flow: each chunk absorbs from its immediate predecessor.
+
+        For all chunks simultaneously:
+          C_1' = C_1  (unchanged, zero-padded predecessor)
+          C_i' = C_i + sigmoid(gate) * Linear(C_{i-1})   for i = 2..K
+
+        Uses original (pre-update) predecessor values — non-cascading.
+
+        Args:
+            x: (B, K, N, C) compressed chunk tokens.
+        Returns:
+            (B, K, N, C) chunks with predecessor information mixed in.
+        """
+        # Shift right: predecessor[i] = x[i-1], predecessor[0] = 0
+        predecessor = F.pad(x[:, :-1], (0, 0, 0, 0, 1, 0))
+        flow = self.flow_proj(predecessor)
+        return x + torch.sigmoid(self.flow_gate) * flow
+
+    def _compute_chunk_orthogonality_loss(self, x):
+        if x.shape[1] <= 1:
+            return x.new_zeros(())
+
+        tokens = rearrange(x, 'b f n c -> b n f c')
+        tokens = F.normalize(tokens, p=2, dim=-1, eps=1e-6)
+        sim = torch.matmul(tokens, tokens.transpose(-1, -2))
+
+        diag_mask = torch.eye(sim.shape[-1], device=sim.device, dtype=torch.bool)
+        sim = sim.masked_fill(diag_mask.view(1, 1, sim.shape[-1], sim.shape[-1]), 0.0)
+
+        denom = x.shape[0] * x.shape[1] * x.shape[2] * max(x.shape[1] - 1, 1)
+        # The following is used for test quadratic loss of cosine similarity
+        return (0.44 * (sim - 0.5).square()).sum() / denom
 
     def _encode_tokens(self, x):
+        self.latest_chunk_ortho_loss = None
         b, f, n, _ = x.shape
+
+        if self.layer_index == 0:
+            x = self._chunk_compress(x, self.chunk_compression_weights)
+            if self.use_pairwise_flow:
+                x = self._pairwise_temporal_flow(x)
+            f = x.shape[1]
 
         x = rearrange(x, 'b f n c  -> (b f) n c')
         x = self.Spatial_patch_to_embedding(x)
         x += self.Spatial_pos_embed
         x = self.pos_drop(x)
-        recover_query = rearrange(x, '(b f) n c -> b f n c', b=b, f=f)
         x = self.STEblocks[0](x)
         x = self.Spatial_norm(x)
 
         x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
-        x += self.Temporal_pos_embed
+        if self.layer_index == 0:
+            x = x + self.pos_embed_token
+        else:
+            x = x + self.Temporal_pos_embed
         x = self.pos_drop(x)
         x = self.TTEblocks[0](x)
         x = self.Temporal_norm(x)
 
         x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        if self.layer_index == 0 and self.use_chunk_ortho_loss:
+            self.latest_chunk_ortho_loss = self._compute_chunk_orthogonality_loss(x)
         for i in range(1, self.block_depth):
             if i == self.layer_index:
-                if self.pruning_strategy == "cluster":
-                    x = self._cluster_temporal_tokens(x)
-                elif self.pruning_strategy == "learned":
-                    x = self._learned_prune_temporal_tokens(x)
-                else:
-                    raise ValueError(f"Unsupported HOT pruning_strategy: {self.pruning_strategy}")
-
+                x = self._chunk_compress(x, self.chunk_compression_weights)
+                if self.use_pairwise_flow:
+                    x = self._pairwise_temporal_flow(x)
+                if self.use_chunk_ortho_loss:
+                    self.latest_chunk_ortho_loss = self._compute_chunk_orthogonality_loss(x)
                 x = rearrange(x, 'b f n c -> (b n) f c')
-                x += self.pos_embed_token
+                x = x + self.pos_embed_token
                 x = rearrange(x, '(b n) f c -> b f n c', n=n)
 
             x = rearrange(x, 'b f n c -> (b f) n c')
@@ -403,22 +1072,643 @@ class PreservedQueryModel(Model):
             x = self.Temporal_norm(x)
             x = rearrange(x, '(b n) f c -> b f n c', n=n)
 
-        return x, recover_query
+        return x
 
-    def _recover_output(self, x, recover_query):
-        b, f, n, c = recover_query.shape
-        x = rearrange(x, 'b f n c -> (b n) f c')
-        recover_query = rearrange(recover_query, 'b f n c -> (b n) f c')
-        recover_query = recover_query + self.cross_attention(recover_query, x, x)
-        recover_query = rearrange(recover_query, '(b n) f c -> b f n c', b=b, n=n)
-        return self.head(recover_query)
+    def _recover_output(self, x):
+        b, f_enc, n, c = x.shape
+
+        if self._effective_decoder_mode == 'cross_attention':
+            # Original HOT recovery: learnable x_token + cross-attention
+            x = rearrange(x, 'b f n c -> (b n) f c')
+            query = self.x_token
+            if self.decoder_query_pos_embed is not None:
+                query = query + self.decoder_query_pos_embed.to(dtype=query.dtype)
+            x_token = repeat(query, '() f c -> b f c', b=b * n)
+
+            if self.decoder_key_pos_embed is not None:
+                # Decoder PE biases temporal matching through Q/K only; V stays content-only.
+                kpe = self.decoder_key_pos_embed.to(dtype=x.dtype)
+                x = x_token + self.cross_attention(x_token, x + kpe, x, attn_mask=self.decoder_local_attn_mask)
+            else:
+                x = x_token + self.cross_attention(x_token, x, x, attn_mask=self.decoder_local_attn_mask)
+            x = rearrange(x, '(b n) f c -> b f n c', n=n)
+            return self.head(x)
+
+        if self._effective_decoder_mode == 'one_step_interp':
+            sparse = self.head(x)  # (B, token_num, N, 3)
+            return self._temporal_resample(sparse, self.recover_num, "linear")
+
+        if self._effective_decoder_mode == 'feature_interp_transform':
+            dense = self._temporal_resample(x, self.recover_num, "linear")
+            dense = self.feature_interp_transform(dense)
+            return self.head(dense)
+
+        if self._effective_decoder_mode == 'feature_interp_attn':
+            dense = self._temporal_resample(x, self.recover_num, "linear")
+            dense = rearrange(dense, 'b t n c -> (b n) t c')
+            dense = dense + self.feature_interp_attn_pos_embed.to(device=dense.device, dtype=dense.dtype)
+            dense = dense + self.feature_interp_attn(self.feature_interp_attn_norm(dense))
+            dense = rearrange(dense, '(b n) t c -> b t n c', b=b, n=n)
+            return self.head(dense)
+
+        if self._effective_decoder_mode == 'feature_interp_affine_attn':
+            dense = self._temporal_resample(x, self.recover_num, "linear")
+            dense = self.feature_interp_affine(dense)
+            dense = rearrange(dense, 'b t n c -> (b n) t c')
+            dense = dense + self.feature_interp_attn_pos_embed.to(device=dense.device, dtype=dense.dtype)
+            dense = dense + self.feature_interp_attn(self.feature_interp_attn_norm(dense))
+            dense = rearrange(dense, '(b n) t c -> b t n c', b=b, n=n)
+            return self.head(dense)
+
+        if self._effective_decoder_mode == 'one_step_interp_cubic':
+            sparse = self.head(x)  # (B, token_num, N, 3)
+            return self._temporal_resample(sparse, self.recover_num, "cubic")
+
+        if self._effective_decoder_mode == 'one_step_upsample':
+            x = rearrange(x, 'b t n c -> (b n) c t')
+            x = self.temporal_upsample(x)  # (B*N, C, recover_num)
+            x = rearrange(x, '(b n) c t -> b t n c', b=b, n=n)
+            return self.head(x)
+
+        if self._effective_decoder_mode == 'two_step_upsample':
+            x = rearrange(x, 'b t n c -> (b n) c t')
+            x = self.temporal_upsample_1(x)  # (B*N, C, intermediate)
+            x = self.temporal_upsample_2(x)  # (B*N, C, recover_num)
+            x = rearrange(x, '(b n) c t -> b t n c', b=b, n=n)
+            return self.head(x)
+
+        if self._effective_decoder_mode == 'ut_insert_attention':
+            x = rearrange(x, 'b f n c -> (b n) f c')
+            x = self._build_ut_dense_sequence(x)
+            for block in self.decoder_ut_blocks:
+                x = block(x)
+            x = x + self.decoder_ut_ffn(self.decoder_ut_ffn_norm(x))
+            x = rearrange(x, '(b n) f c -> b f n c', b=b, n=n)
+            return self.head(x)
+
+        # two_step_mix
+        x = rearrange(x, 'b t n c -> (b n) c t')
+        x = self.temporal_upsample_1(x)  # (B*N, C, intermediate)
+        x = rearrange(x, '(b n) c t -> b t n c', b=b, n=n)
+        sparse = self.head(x)  # (B, intermediate, N, 3)
+        return self._temporal_resample(sparse, self.recover_num, "linear")
 
     def forward(self, x):
-        x, recover_query = self._encode_tokens(x)
-        x = self._recover_output(x, recover_query)
+        x = self._encode_tokens(x)
+        x = self._recover_output(x)
         return x
 
 
+class ChunkCompressMultiStepModel(ChunkedCompressionModel):
+    """HOT variant with explicit multi-stage chunk compression."""
+
+    CENTER81_TWO_STEP_STAGE0_FRAMES = 243
+    CENTER81_TWO_STEP_STAGE0_TOKENS = 162
+    CENTER81_TWO_STEP_STAGE1_TOKENS = 81
+
+    def __init__(self, args):
+        Model.__init__(self, args)
+
+        # Multi-stage chunked compression also bypasses learned token selection entirely.
+        if self.token_selector is not None:
+            del self.token_selector
+            self.token_selector = None
+
+        self.stage_layer_indices = self._parse_stage_values(
+            getattr(args, "hierarchical_layer_indices", "2,3"),
+            "hierarchical_layer_indices",
+        )
+        self.stage_token_nums = self._parse_stage_values(
+            getattr(args, "hierarchical_token_nums", "81,27"),
+            "hierarchical_token_nums",
+        )
+        if len(self.stage_layer_indices) != len(self.stage_token_nums):
+            raise ValueError(
+                "hierarchical_layer_indices and hierarchical_token_nums must have the same length "
+                f"(got {len(self.stage_layer_indices)} and {len(self.stage_token_nums)})."
+            )
+        if not self.stage_layer_indices:
+            raise ValueError("At least one compression stage is required for ChunkCompressMultiStepModel.")
+        if any(layer_idx < 0 or layer_idx >= self.block_depth for layer_idx in self.stage_layer_indices):
+            raise ValueError(
+                f"Compression layer indices must be within [0, {self.block_depth - 1}], "
+                f"but got {self.stage_layer_indices}."
+            )
+        if sorted(self.stage_layer_indices) != self.stage_layer_indices:
+            raise ValueError(
+                f"Compression layer indices must be sorted in increasing order, but got {self.stage_layer_indices}."
+            )
+        if len(set(self.stage_layer_indices)) != len(self.stage_layer_indices):
+            raise ValueError(f"Compression layer indices must be unique, but got {self.stage_layer_indices}.")
+        if self.stage_token_nums[-1] != self.token_num:
+            raise ValueError(
+                f"args.token_num must match the final stage token count for multi-step chunk compression "
+                f"(got token_num={self.token_num}, final_stage={self.stage_token_nums[-1]})."
+            )
+
+        self.chunking_scheme = getattr(args, "chunking_scheme", "even")
+        self.use_chunk_ortho_loss = getattr(args, "use_chunk_ortho_loss", False)
+        self.lambda_chunk_ortho = getattr(args, "lambda_chunk_ortho", 0.0)
+        self.latest_chunk_ortho_loss = None
+
+        self.use_pairwise_flow = getattr(args, "use_pairwise_flow", False)
+        self.stage_flow_projs = nn.ModuleList() if self.use_pairwise_flow else None
+        self.stage_flow_gates = nn.ParameterList() if self.use_pairwise_flow else None
+
+        self.stage_chunk_compression_weights = nn.ParameterList()
+        self.stage_pos_embed_token_names = []
+        self.stage_configs = []
+        self.stage_index_by_layer = {}
+
+        prev_frames = args.frames
+        for stage_idx, (layer_idx, token_num) in enumerate(zip(self.stage_layer_indices, self.stage_token_nums)):
+            if token_num <= 0 or token_num > prev_frames:
+                raise ValueError(
+                    f"Stage {stage_idx} token_num must be in [1, {prev_frames}], but got {token_num}."
+                )
+
+            chunk_size = prev_frames // token_num
+            if chunk_size == 0:
+                raise ValueError(
+                    f"Stage {stage_idx} token_num must be no larger than its input frames "
+                    f"(frames={prev_frames}, token_num={token_num})."
+                )
+
+            chunk_lengths = self._resolve_stage_chunk_lengths(
+                prev_frames,
+                token_num,
+                stage_idx,
+                self.chunking_scheme,
+            )
+            use_uneven_chunking = chunk_lengths is not None
+            max_chunk_size = max(chunk_lengths) if use_uneven_chunking else chunk_size
+            weight_dim = 2 if layer_idx == 0 else args.channel
+            self.stage_chunk_compression_weights.append(
+                nn.Parameter(self._build_stage_chunk_weight_init(token_num, chunk_size, chunk_lengths, max_chunk_size, weight_dim))
+            )
+
+            if stage_idx == len(self.stage_token_nums) - 1:
+                self.stage_pos_embed_token_names.append(None)
+            else:
+                pos_embed_name = f"_stage_{stage_idx}_pos_embed_token"
+                self.register_parameter(
+                    pos_embed_name,
+                    nn.Parameter(torch.zeros(1, token_num, args.channel)),
+                )
+                self.stage_pos_embed_token_names.append(pos_embed_name)
+
+            if self.use_pairwise_flow:
+                self.stage_flow_projs.append(nn.Linear(weight_dim, weight_dim))
+                self.stage_flow_gates.append(nn.Parameter(torch.full((1,), -5.0)))
+
+            chunk_offsets_list = None
+            valid_mask_name = None
+            singleton_chunk_indices = None
+            if use_uneven_chunking:
+                chunk_lengths_tensor = torch.tensor(chunk_lengths, dtype=torch.long)
+                chunk_offsets = torch.cat(
+                    [chunk_lengths_tensor.new_zeros(1), chunk_lengths_tensor.cumsum(dim=0)[:-1]],
+                    dim=0,
+                )
+                chunk_offsets_list = chunk_offsets.tolist()
+                singleton_chunk_indices = [idx for idx, chunk_len in enumerate(chunk_lengths) if chunk_len == 1]
+                chunk_position_ids = torch.arange(max_chunk_size, dtype=torch.long).unsqueeze(0)
+                chunk_valid_mask = (
+                    chunk_position_ids < chunk_lengths_tensor.unsqueeze(1)
+                ).view(1, token_num, max_chunk_size, 1)
+                valid_mask_name = f"_stage_{stage_idx}_chunk_valid_mask"
+                self.register_buffer(valid_mask_name, chunk_valid_mask, persistent=False)
+
+            self.stage_configs.append(
+                {
+                    "layer_idx": layer_idx,
+                    "token_num": token_num,
+                    "input_frames": prev_frames,
+                    "chunk_size": chunk_size,
+                    "chunk_lengths": chunk_lengths,
+                    "use_uneven_chunking": use_uneven_chunking,
+                    "max_chunk_size": max_chunk_size,
+                    "chunk_offsets_list": chunk_offsets_list,
+                    "singleton_chunk_indices": singleton_chunk_indices,
+                    "chunk_valid_mask_name": valid_mask_name,
+                }
+            )
+            self.stage_index_by_layer[layer_idx] = stage_idx
+            prev_frames = token_num
+
+        self.decoder_mode = getattr(args, "decoder_mode", "cross_attention")
+        assert self.decoder_mode in self.SUPPORTED_DECODER_MODES, \
+            f"Unknown decoder_mode: {self.decoder_mode}. Must be one of {self.SUPPORTED_DECODER_MODES}"
+        self.decoder_cross_pe = getattr(args, "decoder_cross_pe", "none")
+        if self.decoder_cross_pe not in ("none", "query", "query_key"):
+            raise ValueError(
+                f"Unknown decoder_cross_pe: {self.decoder_cross_pe}. Must be one of "
+                f"('none', 'query', 'query_key')."
+            )
+        self.decoder_cross_attn_local_radius = getattr(args, "decoder_cross_attn_local_radius", -1)
+
+        self._effective_decoder_mode = self.decoder_mode
+        if self.decoder_mode == 'two_step_upsample' \
+                and self.token_num not in self.TWO_STEP_UPSAMPLE_CFG:
+            print(f"[ChunkCompressMultiStepModel] two_step_upsample not supported for "
+                  f"token_num={self.token_num}. Falling back to one_step_upsample.")
+            self._effective_decoder_mode = 'one_step_upsample'
+
+        if self.decoder_mode == 'two_step_mix' \
+                and self.token_num not in self.TWO_STEP_MIX_CFG:
+            print(f"[ChunkCompressMultiStepModel] two_step_mix not supported for "
+                  f"token_num={self.token_num}. Falling back to one_step_interp.")
+            self._effective_decoder_mode = 'one_step_interp'
+
+        if self._effective_decoder_mode in ('ut_insert_attention', 'feature_interp_attn'):
+            raise NotImplementedError(
+                f"decoder_mode='{self._effective_decoder_mode}' is currently implemented for ChunkedCompressionModel only."
+            )
+
+        if self._effective_decoder_mode == 'cross_attention':
+            if self.decoder_cross_pe in ("query", "query_key"):
+                self.register_buffer(
+                    "decoder_query_pos_embed",
+                    self._build_sinusoidal_pos_embed(self.recover_num, args.channel),
+                    persistent=False,
+                )
+            else:
+                self.decoder_query_pos_embed = None
+
+            if self.decoder_cross_pe == "query_key":
+                self.register_buffer(
+                    "decoder_key_pos_embed",
+                    self._build_sinusoidal_pos_embed(self.token_num, args.channel),
+                    persistent=False,
+                )
+            else:
+                self.decoder_key_pos_embed = None
+
+            if self.decoder_cross_attn_local_radius >= 0:
+                self.register_buffer(
+                    "decoder_local_attn_mask",
+                    self._build_decoder_local_attn_mask(
+                        self.recover_num,
+                        self.token_num,
+                        self.decoder_cross_attn_local_radius,
+                    ),
+                    persistent=False,
+                )
+            else:
+                self.decoder_local_attn_mask = None
+        else:
+            self.decoder_query_pos_embed = None
+            self.decoder_key_pos_embed = None
+            self.decoder_local_attn_mask = None
+
+        self._init_decoder_layers(args.channel, args.frames // self.token_num)
+
+    @staticmethod
+    def _parse_stage_values(value, arg_name):
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(',') if part.strip()]
+        elif isinstance(value, (list, tuple)):
+            parts = list(value)
+        else:
+            raise TypeError(f"{arg_name} must be a comma-separated string or a sequence, but got {type(value).__name__}.")
+
+        try:
+            parsed = [int(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError(f"{arg_name} must contain only integers, but got {value}.") from exc
+
+        return parsed
+
+    @staticmethod
+    def _build_stage_chunk_weight_init(token_num, chunk_size, chunk_lengths, max_chunk_size, channel_dim):
+        if chunk_lengths is None:
+            return torch.full((1, token_num, chunk_size, channel_dim), 1.0 / chunk_size)
+
+        weight_init = torch.zeros((1, token_num, max_chunk_size, channel_dim))
+        for chunk_idx, chunk_len in enumerate(chunk_lengths):
+            weight_init[:, chunk_idx, :chunk_len, :] = 1.0 / chunk_len
+        return weight_init
+
+    @classmethod
+    def _resolve_stage_chunk_lengths(cls, frames, token_num, stage_idx, chunking_scheme):
+        if chunking_scheme == "center81_two_step":
+            return cls._build_center81_two_step_chunk_lengths(frames, token_num, stage_idx)
+        return cls._resolve_chunk_lengths(frames, token_num, chunking_scheme)
+
+    @classmethod
+    def _build_center81_two_step_chunk_lengths(cls, frames, token_num, stage_idx):
+        if stage_idx == 0:
+            if frames != cls.CENTER81_TWO_STEP_STAGE0_FRAMES:
+                raise ValueError(
+                    "chunking_scheme='center81_two_step' stage 0 requires "
+                    f"frames={cls.CENTER81_TWO_STEP_STAGE0_FRAMES}, but got {frames}."
+                )
+            if token_num != cls.CENTER81_TWO_STEP_STAGE0_TOKENS:
+                raise ValueError(
+                    "chunking_scheme='center81_two_step' stage 0 requires "
+                    f"token_num={cls.CENTER81_TWO_STEP_STAGE0_TOKENS}, but got {token_num}."
+                )
+
+            chunk_lengths = [2] * 41 + [1] * 81 + [2] * 40
+            if len(chunk_lengths) != token_num or sum(chunk_lengths) != frames:
+                raise ValueError(
+                    "chunking_scheme='center81_two_step' produced an invalid stage-0 layout: "
+                    f"len={len(chunk_lengths)}, sum={sum(chunk_lengths)}, "
+                    f"expected token_num={token_num}, frames={frames}."
+                )
+            return chunk_lengths
+
+        if stage_idx == 1:
+            if frames != cls.CENTER81_TWO_STEP_STAGE0_TOKENS:
+                raise ValueError(
+                    "chunking_scheme='center81_two_step' stage 1 requires "
+                    f"frames={cls.CENTER81_TWO_STEP_STAGE0_TOKENS}, but got {frames}."
+                )
+            if token_num != cls.CENTER81_TWO_STEP_STAGE1_TOKENS:
+                raise ValueError(
+                    "chunking_scheme='center81_two_step' stage 1 requires "
+                    f"token_num={cls.CENTER81_TWO_STEP_STAGE1_TOKENS}, but got {token_num}."
+                )
+            return None
+
+        raise ValueError(
+            "chunking_scheme='center81_two_step' only supports a two-stage hierarchy "
+            f"{cls.CENTER81_TWO_STEP_STAGE0_FRAMES}->"
+            f"{cls.CENTER81_TWO_STEP_STAGE0_TOKENS}->"
+            f"{cls.CENTER81_TWO_STEP_STAGE1_TOKENS}, but got unexpected stage_idx={stage_idx}."
+        )
+
+    def _init_decoder_layers(self, embed_dim, base_chunk_size):
+        if self._effective_decoder_mode == 'cross_attention':
+            return
+
+        if self._effective_decoder_mode in ('one_step_interp', 'feature_interp_transform', 'feature_interp_attn', 'one_step_interp_cubic'):
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+            return
+
+        if self._effective_decoder_mode == 'one_step_upsample':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            self.temporal_upsample = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=base_chunk_size, stride=base_chunk_size,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+            return
+
+        if self._effective_decoder_mode == 'two_step_upsample':
+            del self.cross_attention
+            self.register_parameter('x_token', None)
+            _, s1, s2 = self.TWO_STEP_UPSAMPLE_CFG[self.token_num]
+            self.temporal_upsample_1 = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=s1, stride=s1,
+            )
+            self.temporal_upsample_2 = nn.ConvTranspose1d(
+                in_channels=embed_dim, out_channels=embed_dim,
+                kernel_size=s2, stride=s2,
+            )
+            self.head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, 3),
+            )
+            return
+
+        del self.cross_attention
+        self.register_parameter('x_token', None)
+        self._intermediate, s1 = self.TWO_STEP_MIX_CFG[self.token_num]
+        self.temporal_upsample_1 = nn.ConvTranspose1d(
+            in_channels=embed_dim, out_channels=embed_dim,
+            kernel_size=s1, stride=s1,
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, 3),
+        )
+
+    def _chunk_compress_stage(self, x, stage_idx):
+        cfg = self.stage_configs[stage_idx]
+        weights = self.stage_chunk_compression_weights[stage_idx]
+        b, f, n, _ = x.shape
+        if cfg["token_num"] <= 0 or cfg["token_num"] > f:
+            raise ValueError(
+                f"Stage {stage_idx} token_num must be in [1, {f}] for chunked compression."
+            )
+
+        if cfg["use_uneven_chunking"]:
+            expected_frames = sum(cfg["chunk_lengths"])
+            if f != expected_frames:
+                raise ValueError(
+                    f"Stage {stage_idx} expected frames={expected_frames} for uneven chunking but got {f}."
+                )
+            if weights.shape[2] != cfg["max_chunk_size"]:
+                raise ValueError(
+                    f"Stage {stage_idx} expected max_chunk_size={cfg['max_chunk_size']} "
+                    f"but got {weights.shape[2]}."
+                )
+
+            chunked = x.new_zeros((b, cfg["token_num"], cfg["max_chunk_size"], n, x.shape[-1]))
+            for chunk_idx, (start, chunk_len) in enumerate(zip(cfg["chunk_offsets_list"], cfg["chunk_lengths"])):
+                chunked[:, chunk_idx, :chunk_len] = x[:, start:start + chunk_len]
+
+            chunked = rearrange(chunked, 'b k s n c -> (b n) k s c')
+            chunk_valid_mask = getattr(self, cfg["chunk_valid_mask_name"]).to(dtype=weights.dtype)
+            masked_weights = weights * chunk_valid_mask
+            masked_weights = masked_weights / (masked_weights.sum(dim=2, keepdim=True) + 1e-6)
+            compressed = (chunked * masked_weights).sum(dim=2)
+            if cfg["singleton_chunk_indices"]:
+                compressed[:, cfg["singleton_chunk_indices"]] = chunked[:, cfg["singleton_chunk_indices"], 0]
+            return rearrange(compressed, '(b n) k c -> b k n c', b=b, n=n)
+
+        chunk_size = f // cfg["token_num"]
+        usable_f = cfg["token_num"] * chunk_size
+        if chunk_size != cfg["chunk_size"] or weights.shape[2] != cfg["chunk_size"]:
+            raise ValueError(
+                f"Stage {stage_idx} expected chunk_size={cfg['chunk_size']} but got chunk_size={chunk_size}."
+            )
+
+        x = x[:, :usable_f]
+        x = rearrange(x, 'b (k s) n c -> (b n) k s c', k=cfg["token_num"], s=chunk_size)
+        weights = weights / (weights.sum(dim=2, keepdim=True) + 1e-6)
+        x = (x * weights).sum(dim=2)
+        return rearrange(x, '(b n) k c -> b k n c', b=b, n=n)
+
+    def _pairwise_temporal_flow_stage(self, x, stage_idx):
+        predecessor = F.pad(x[:, :-1], (0, 0, 0, 0, 1, 0))
+        flow = self.stage_flow_projs[stage_idx](predecessor)
+        return x + torch.sigmoid(self.stage_flow_gates[stage_idx]) * flow
+
+    def _get_stage_pos_embed_token(self, stage_idx):
+        pos_embed_name = self.stage_pos_embed_token_names[stage_idx]
+        if pos_embed_name is None:
+            return self.pos_embed_token
+        return getattr(self, pos_embed_name)
+
+    def _encode_tokens(self, x):
+        self.latest_chunk_ortho_loss = None
+        ortho_loss = None
+        b, f, n, _ = x.shape
+
+        stage0_idx = self.stage_index_by_layer.get(0)
+        if stage0_idx is not None:
+            x = self._chunk_compress_stage(x, stage0_idx)
+            if self.use_pairwise_flow:
+                x = self._pairwise_temporal_flow_stage(x, stage0_idx)
+            f = x.shape[1]
+
+        x = rearrange(x, 'b f n c  -> (b f) n c')
+        x = self.Spatial_patch_to_embedding(x)
+        x += self.Spatial_pos_embed
+        x = self.pos_drop(x)
+        x = self.STEblocks[0](x)
+        x = self.Spatial_norm(x)
+
+        x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+        if stage0_idx is not None:
+            x = x + self._get_stage_pos_embed_token(stage0_idx)
+        else:
+            x = x + self.Temporal_pos_embed
+        x = self.pos_drop(x)
+        x = self.TTEblocks[0](x)
+        x = self.Temporal_norm(x)
+
+        x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        if stage0_idx is not None and self.use_chunk_ortho_loss:
+            ortho_loss = self._compute_chunk_orthogonality_loss(x)
+
+        for i in range(1, self.block_depth):
+            stage_idx = self.stage_index_by_layer.get(i)
+            if stage_idx is not None:
+                x = self._chunk_compress_stage(x, stage_idx)
+                if self.use_pairwise_flow:
+                    x = self._pairwise_temporal_flow_stage(x, stage_idx)
+                if self.use_chunk_ortho_loss:
+                    current_ortho = self._compute_chunk_orthogonality_loss(x)
+                    ortho_loss = current_ortho if ortho_loss is None else ortho_loss + current_ortho
+                x = rearrange(x, 'b f n c -> (b n) f c')
+                x = x + self._get_stage_pos_embed_token(stage_idx)
+                x = rearrange(x, '(b n) f c -> b f n c', n=n)
+
+            x = rearrange(x, 'b f n c -> (b f) n c')
+            steblock = self.STEblocks[i]
+            tteblock = self.TTEblocks[i]
+
+            x = steblock(x)
+            x = self.Spatial_norm(x)
+            x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
+
+            x = tteblock(x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) f c -> b f n c', n=n)
+
+        self.latest_chunk_ortho_loss = ortho_loss
+        return x
+class PreservedQueryModel(Model):
+    def __init__(self, args):
+        super().__init__(args)
+        # This variant does not decode from a learned query token.
+        self.register_parameter("x_token", None)
+
+        embed_dim = args.channel
+        mlp_hidden_dim = args.channel * 2
+        num_joints = args.n_joints
+        num_heads = 8
+        drop_rate = 0.
+        attn_drop_rate = 0.
+        drop_path_rate = 0.1
+        qkv_bias = True
+        qk_scale = None
+        norm_layer = partial(nn.LayerNorm, eps=1e-6)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.block_depth)]
+
+        # Independent query generation head
+        self.query_Spatial_patch_to_embedding = nn.Linear(2, embed_dim)
+        self.query_Spatial_pos_embed = nn.Parameter(torch.zeros(1, num_joints, embed_dim))
+        self.query_Temporal_pos_embed = nn.Parameter(torch.zeros(1, args.frames, embed_dim))
+        self.query_pos_drop = nn.Dropout(p=drop_rate)
+        self.query_STEblock = Block(
+            dim=embed_dim, num_heads=num_heads, mlp_hidden_dim=mlp_hidden_dim,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+            attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer,
+        )
+        self.query_TTEblock = Block(
+            dim=embed_dim, num_heads=num_heads, mlp_hidden_dim=mlp_hidden_dim,
+            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+            attn_drop=attn_drop_rate, drop_path=dpr[0], norm_layer=norm_layer,
+            depth=self.block_depth,
+        )
+        self.query_Spatial_norm = norm_layer(embed_dim)
+        self.query_Temporal_norm = norm_layer(embed_dim)
+
+        # Decoder mode: "cross_attention" (original) or "conv_upsample" (new)
+        self.decoder_mode = getattr(args, "decoder_mode", "cross_attention")
+        assert self.decoder_mode in ("cross_attention", "conv_upsample"), \
+            f"Unknown decoder_mode for PreservedQueryModel: {self.decoder_mode}"
+
+        if self.decoder_mode == "conv_upsample":
+            del self.cross_attention
+            upsample_stride = self.recover_num // self.token_num
+            self.temporal_upsample = nn.ConvTranspose1d(
+                in_channels=embed_dim,
+                out_channels=embed_dim,
+                kernel_size=upsample_stride,
+                stride=upsample_stride,
+            )
+            self.encoded_norm = norm_layer(embed_dim)
+            self.query_out_norm = norm_layer(embed_dim)
+
+    def _generate_query(self, x):
+        b, f, n, _ = x.shape
+        x = rearrange(x, 'b f n c -> (b f) n c')
+        x = self.query_Spatial_patch_to_embedding(x)
+        x += self.query_Spatial_pos_embed
+        x = self.query_pos_drop(x)
+        x = self.query_STEblock(x)
+        x = self.query_Spatial_norm(x)
+        x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+        x += self.query_Temporal_pos_embed
+        x = self.query_pos_drop(x)
+        x = self.query_TTEblock(x)
+        x = self.query_Temporal_norm(x)
+        x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        return x
+
+    def _recover_output(self, x, query):
+        b, f_q, n, c = query.shape
+
+        if self.decoder_mode == "cross_attention":
+            x = rearrange(x, 'b f n c -> (b n) f c')
+            query = rearrange(query, 'b f n c -> (b n) f c')
+            query = query + self.cross_attention(query, x, x)
+            query = rearrange(query, '(b n) f c -> b f n c', b=b, n=n)
+            return self.head(query)
+
+        # conv_upsample: upsample encoded tokens, then fuse with query via addition
+        x = rearrange(x, 'b f n c -> (b n) c f')
+        x = self.temporal_upsample(x)  # (B*N, C, frames)
+        x = rearrange(x, '(b n) c f -> b f n c', b=b, n=n)
+
+        # LayerNorm both branches to align activation scales
+        x = self.encoded_norm(x)
+        query = self.query_out_norm(query)
+
+        # Fuse and regress to 3D
+        fused = x + query
+        return self.head(fused)
+
+    def forward(self, x):
+        query = self._generate_query(x)
+        encoded = self._encode_tokens(x)
+        output = self._recover_output(encoded, query)
+        return output
 class MultiHypothesisModel(Model):
     def __init__(self, args):
         super().__init__(args)
@@ -459,7 +1749,142 @@ class MultiHypothesisModel(Model):
         encoded = self._encode_tokens(x)
         hypotheses = self._recover_all_hypotheses(encoded)
         return self._select_best_hypothesis(hypotheses)
+class OracleSelectionModel(Model):
+    """Ablation variant: oracle temporal token selection using GT 2D poses.
 
+    Instead of clustering or learned pruning, compares detected 2D poses with
+    ground-truth 2D poses per frame (MSE) and keeps the top-K frames with
+    the smallest error.  This serves as an upper-bound experiment for token
+    selection quality.
+
+    Key difference from :class:`Model`: the K best frames are selected from
+    the raw input *before* any encoding.  Only K frames flow through the
+    entire STE/TTE backbone (no mid-network pruning step).  Temporal positional
+    embeddings are gathered per-sample so that each selected frame retains its
+    correct position encoding.
+
+    Forward signature: ``forward(detected_2d, gt_2d)`` instead of ``forward(x)``.
+    """
+
+    def __init__(self, args):
+        args.pruning_strategy = 'cluster'
+        super().__init__(args)
+        # pos_embed_token is not used (no mid-network pruning step).
+        self.register_parameter('pos_embed_token', None)
+        self.oracle_mode = getattr(args, 'oracle_mode', 'global')
+
+    # ------------------------------------------------------------------
+    # Oracle index computation
+    # ------------------------------------------------------------------
+    def _compute_oracle_indices(self, x, gt_2d):
+        """Compute oracle frame indices based on MSE between detected and GT 2D.
+
+        Args:
+            x:      Detected 2D poses, shape ``(B, F, J, 2)``.
+            gt_2d:  Ground-truth 2D poses, shape ``(B, F, J, 2)``.
+
+        Returns:
+            Sorted global frame indices, shape ``(B, token_num)``.
+        """
+        b, T = x.shape[0], x.shape[1]
+
+        if self.oracle_mode == 'chunked':
+            chunk_size = T // self.token_num
+            usable_T = self.token_num * chunk_size
+
+            # (B, token_num, chunk_size, J, 2)
+            x_chunks = x[:, :usable_T].reshape(b, self.token_num, chunk_size, *x.shape[2:])
+            gt_chunks = gt_2d[:, :usable_T].reshape(b, self.token_num, chunk_size, *gt_2d.shape[2:])
+
+            # Per-frame MSE within each chunk -> (B, token_num, chunk_size)
+            per_chunk_mse = ((x_chunks - gt_chunks) ** 2).mean(dim=(-1, -2))
+
+            # Best frame index within each chunk -> (B, token_num)
+            best_in_chunk = per_chunk_mse.argmin(dim=-1)
+
+            # Convert to global frame indices
+            chunk_starts = torch.arange(self.token_num, device=x.device) * chunk_size
+            indices = chunk_starts[None, :] + best_in_chunk  # (B, token_num)
+        else:
+            # Global top-K
+            per_frame_mse = ((x - gt_2d) ** 2).mean(dim=(-1, -2))  # (B, F)
+            _, indices = torch.topk(per_frame_mse, k=self.token_num, largest=False)
+            indices, _ = torch.sort(indices, dim=-1)
+
+        return indices
+
+    # ------------------------------------------------------------------
+    # Overridden encoder: no mid-network pruning, gathered temporal PE
+    # ------------------------------------------------------------------
+    def _encode_tokens(self, x, temporal_indices):
+        """Encode pre-selected tokens with correct positional embeddings.
+
+        Args:
+            x: Pre-selected 2D poses, shape ``(B, K, J, 2)`` where K = token_num.
+            temporal_indices: Original frame indices of the selected tokens,
+                shape ``(B, K)``, used to gather from ``Temporal_pos_embed``.
+        """
+        b, f, n, _ = x.shape  # f = token_num (K)
+
+        # ---- Spatial embedding (identical to parent) ----
+        x = rearrange(x, 'b f n c -> (b f) n c')
+        x = self.Spatial_patch_to_embedding(x)
+        x += self.Spatial_pos_embed
+        x = self.pos_drop(x)
+        x = self.STEblocks[0](x)
+        x = self.Spatial_norm(x)
+
+        # ---- Temporal embedding (gathered per-sample) ----
+        x = rearrange(x, '(b f) n c -> (b n) f c', f=f)
+        c = x.shape[-1]
+        tpe = self.Temporal_pos_embed.expand(b, -1, -1)           # (B, 243, C)
+        idx = temporal_indices.unsqueeze(-1).expand(-1, -1, c)    # (B, K, C)
+        temporal_pe = torch.gather(tpe, 1, idx)                   # (B, K, C)
+        temporal_pe = repeat(temporal_pe, 'b f c -> (b n) f c', n=n)
+        x += temporal_pe
+
+        x = self.pos_drop(x)
+        x = self.TTEblocks[0](x)
+        x = self.Temporal_norm(x)
+
+        # ---- Remaining STE/TTE blocks ----
+        x = rearrange(x, '(b n) f c -> b f n c', n=n)
+        for i in range(1, self.block_depth):
+            x = rearrange(x, 'b f n c -> (b f) n c')
+            x = self.STEblocks[i](x)
+            x = self.Spatial_norm(x)
+            x = rearrange(x, '(b f) n c -> (b n) f c', b=b)
+
+            x = self.TTEblocks[i](x)
+            x = self.Temporal_norm(x)
+            x = rearrange(x, '(b n) f c -> b f n c', n=n)
+
+        return x
+
+    # ------------------------------------------------------------------
+    # Public forward
+    # ------------------------------------------------------------------
+    def forward(self, x, gt_2d):
+        """
+        Args:
+            x:      Detected 2D poses, shape ``(B, F, J, 2)``.
+            gt_2d:  Ground-truth 2D poses, shape ``(B, F, J, 2)``.
+
+        Returns:
+            Predicted 3D poses, shape ``(B, F, J, 3)``.
+        """
+        b = x.shape[0]
+
+        indices = self._compute_oracle_indices(x, gt_2d)
+
+        # Pre-select frames from raw input
+        batch_ind = torch.arange(b, device=x.device).unsqueeze(-1)
+        x = x[batch_ind, indices]  # (B, K, J, 2)
+
+        # Encode (only K frames) and recover (back to full sequence)
+        x = self._encode_tokens(x, indices)
+        x = self._recover_output(x)
+        return x
 
 if __name__ == '__main__':
     import argparse

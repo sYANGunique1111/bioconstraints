@@ -21,13 +21,15 @@ def parse_args():
     parser.add_argument('-lr', '--learning_rate', default=0.00006, type=float)
     parser.add_argument('-lrd', '--lr_decay', default=0.976, type=float)
     parser.add_argument('-f', '--number_of_frames', default=243, type=int)
+    parser.add_argument('--loss_type', default='mpjpe', type=str, choices=['mpjpe', 'fweighted_mpjpe'],
+                        help='Training loss: standard MPJPE or frame-weighted MPJPE')
     parser.add_argument('--train_stage', default=1, type=int, choices=[1, 2],
                         help='Two-stage training phase: 1 trains the evaluator, 2 trains the regressor')
     parser.add_argument('-no-da', '--no-data-augmentation', dest='data_augmentation', action='store_false')
 
     # Model architecture
     parser.add_argument('--model', default='mixste', type=str,
-                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, hybrid_jointwise_mixste, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_multi, hot_mixste_preserved_query, h2ot_mixste, h2ot_mixste_interp')
+                        help='Model architecture: mixste, hybrid3, hybrid3_2, hybrid_mixste, hybrid_mixste_v2, hybrid_joint_conv, hybrid_jointwise_mixste, hybrid_jointwise_mixste, two_stage_grouped, two_stage_patched, hot_mixste, hot_mixste_chunked, hot_mixste_chunked_multistep, hot_mixste_multi, hot_mixste_preserved_query, h2ot_mixste, h2ot_mixste_interp')
     parser.add_argument('--embed_dim', default=512, type=int)
     parser.add_argument('--depth', default=8, type=int)
     parser.add_argument('--num_heads', default=8, type=int)
@@ -37,9 +39,15 @@ def parse_args():
     parser.add_argument('--use_normalized_graph', action='store_true',
                         help='Apply a fixed normalized H36M graph residual in HybridJointWiseMixSTE after joint-wise projection')
     parser.add_argument('--decoder_mode', default='simple', type=str,
-                        help='Decoder mode for HybridJointWiseMixSTE: simple, one_step_interp, one_step_upsample, two_step_upsample, two_step_mix')
-    parser.add_argument('--embed_mode', default='joint', type=str, choices=['joint', 'temporal', 'shared'],
+                        help='Decoder mode for HybridJointWiseMixSTE/HOT variants: simple, one_step_interp, feature_interp_transform, feature_interp_attn, one_step_interp_cubic, one_step_upsample, two_step_upsample, two_step_mix, cross_attn_recovery')
+    parser.add_argument('--decoder_cross_pe', default='none', type=str, choices=['none', 'query', 'query_key'],
+                        help='Decoder cross-attention positional encoding mode for HOT chunked models: query adds PE to Q only, query_key adds PE to Q and K')
+    parser.add_argument('--decoder_cross_attn_local_radius', default=-1, type=int,
+                        help='Local attention radius for HOT chunked cross-attention decoder; use -1 for full attention')
+    parser.add_argument('--embed_mode', default='joint', type=str, choices=['joint', 'temporal'],
                         help='Embedding orientation for HybridJointWiseMixSTE: joint (per-joint projection) or temporal (per-time-patch projection)')
+    parser.add_argument('--norm_mode', default=None, type=str, choices=[None, 'joint'],
+                        help='Normalization mode for HybridJointWiseMixSTE: None (standard LayerNorm) or joint (per-joint learnable gamma/beta)')
     parser.add_argument('--drop_rate', default=0.0, type=float)
     parser.add_argument('--attn_drop_rate', default=0.0, type=float)
     parser.add_argument('--drop_path_rate', default=0.2, type=float)
@@ -48,7 +56,7 @@ def parse_args():
     parser.add_argument('--token_num', default=81, type=int,
                         help='Fallback single-stage clustered token number for HOT/H2OT models')
     parser.add_argument('--layer_index', default=1, type=int,
-                        help='Fallback single-stage clustering block index for HOT/H2OT models')
+                        help='Fallback single-stage clustering block index for HOT/H2OT models; use 0 to apply on raw 2D input')
     parser.add_argument('--hierarchical_layer_indices', default='1,2', type=str,
                         help='Comma-separated clustering block indices for H2OT (e.g. "1,2")')
     parser.add_argument('--hierarchical_token_nums', default='81,27', type=str,
@@ -63,12 +71,18 @@ def parse_args():
                         help='HOT/H2OT pruning strategy: cluster, learned, motion, sampler')
     parser.add_argument('--num_hypotheses', default=5, type=int,
                         help='Number of output hypotheses for hot_mixste_multi')
-    parser.add_argument('--symmetry_floor', default=1e-3, type=float,
-                        help='Positive floor added before symmetry-loss normalization in hot_mixste_multi')
-    parser.add_argument('--joint_angle_floor', default=1e-3, type=float,
-                        help='Positive floor added before joint-angle-loss normalization in hot_mixste_multi')
-    parser.add_argument('--score_eps', default=1e-8, type=float,
-                        help='Numerical epsilon for hot_mixste_multi hypothesis-score normalization')
+    parser.add_argument('--use_chunk_ortho_loss', action='store_true',
+                        help='Enable optional orthogonality regularization for hot_mixste_chunked tokens')
+    parser.add_argument('--lambda_chunk_ortho', default=0.0, type=float,
+                        help='Weight for the optional orthogonality regularization in hot_mixste_chunked')
+    parser.add_argument('--chunking_scheme', default='even', type=str,
+                        help='Chunk layout for hot_mixste_chunked and hot_mixste_chunked_multistep: even, corner_aligned, center81_two_step')
+    parser.add_argument('--use_pairwise_flow', action='store_true',
+                        help='Enable parallel pairwise temporal flow between consecutive chunks in hot_mixste_chunked')
+    parser.add_argument('--lambda_sym', default=1.0, type=float,
+                        help='Weight for symmetry quality score in sigmoid-based hypothesis selection')
+    parser.add_argument('--lambda_angle', default=10.0, type=float,
+                        help='Weight for joint angle quality score in sigmoid-based hypothesis selection')
     parser.add_argument('--recovery_strategy', default='attention', type=str,
                         help='H2OT recovery strategy: attention, interpolation')
     parser.add_argument('--use_return_pre_interp', action=argparse.BooleanOptionalAction, default=True,
@@ -88,7 +102,7 @@ def parse_args():
     parser.add_argument('--master_addr', default='127.0.0.1', type=str)
 
     # Other
-    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--num_workers', default=8, type=int)
     parser.add_argument('--subset', default=1, type=float)
     parser.add_argument('--nolog', action='store_true')
     

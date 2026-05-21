@@ -2,7 +2,7 @@
 from common.skeleton import Skeleton
 from common.mocap_dataset import MocapDataset
 from common.camera import normalize_screen_coordinates, world_to_camera, camera_to_world
-from common.loss import mpjpe, p_mpjpe, n_mpjpe
+from common.loss import mpjpe, p_mpjpe, n_mpjpe, fweighted_mpjpe
 
 __all__ = [
     'Skeleton',
@@ -12,5 +12,6 @@ __all__ = [
     'camera_to_world',
     'mpjpe',
     'p_mpjpe',
-    'n_mpjpe'
+    'n_mpjpe',
+    'fweighted_mpjpe'
 ]

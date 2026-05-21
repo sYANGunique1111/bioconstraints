@@ -2,6 +2,27 @@ import torch
 import numpy as np
 
 
+def temporal_boundary_weights(num_frames, device=None, dtype=None):
+    """
+    Generate frame weights that increase smoothly from the center frame to the boundaries.
+
+    For odd T, the center frame has weight exp(0) = 1 and the boundary frames have
+    weight exp(1) = e.
+    """
+    if num_frames % 2 == 0:
+        raise ValueError(f"temporal_boundary_weights expects an odd number of frames, got {num_frames}")
+
+    center_idx = num_frames // 2
+    frame_indices = torch.arange(num_frames, device=device, dtype=torch.float32)
+    normalized_distance = (frame_indices - center_idx).abs() / center_idx
+    weights = torch.exp(normalized_distance)
+
+    if dtype is not None:
+        weights = weights.to(dtype=dtype)
+
+    return weights
+
+
 def mpjpe(predicted, target, return_joints_err=False):
     """
     Mean per-joint position error (i.e. mean Euclidean distance),
@@ -17,6 +38,27 @@ def mpjpe(predicted, target, return_joints_err=False):
         errors = rearrange(errors, 'B T N -> N (B T)')
         errors = torch.mean(errors, dim=-1).cpu().numpy().reshape(-1) * 1000
         return torch.mean(torch.norm(predicted - target, dim=len(target.shape)-1)), errors
+
+
+def fweighted_mpjpe(predicted, target):
+    """
+    MPJPE with temporal weighting that emphasizes boundary frames more than center frames.
+
+    The temporal dimension is assumed to be axis 1 with an odd number of frames T.
+    Each frame t_i receives weight exp(abs(t_i - t_c) / (T // 2)).
+    """
+    assert predicted.shape == target.shape
+    if predicted.dim() < 3:
+        raise ValueError(f"fweighted_mpjpe expects at least 3 dimensions, got shape {predicted.shape}")
+
+    num_frames = predicted.shape[1]
+    weights = temporal_boundary_weights(num_frames, device=predicted.device, dtype=predicted.dtype)
+
+    errors = torch.norm(predicted - target, dim=len(target.shape) - 1)
+    errors = errors.reshape(errors.shape[0], errors.shape[1], -1).mean(dim=-1)
+
+    weighted_errors = errors * weights.view(1, num_frames)
+    return (weighted_errors.sum(dim=1) / weights.sum()).mean()
 
 
 def mpjpe_diffusion(predicted, target, mean_pos=False):

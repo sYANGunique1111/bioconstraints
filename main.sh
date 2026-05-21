@@ -20,9 +20,11 @@ cd "${SCRIPT_DIR}"
 
 # Training defaults
 KEYPOINTS="cpn_ft_h36m_dbb"
-MODEL="hot_mixste_preserved_query"
-CHECKPOINT_DIR="hot_mixste_preserved_query_h36m_cpn_token_pruning_learned_patch3"
-DECODER_MODE="one_step_interp"
+MODEL="hot_mixste_chunked"
+CHECKPOINT_DIR="hot_mixste_chunked_layer3_token81_feature_interp_affine_attn"
+DECODER_MODE="feature_interp_affine_attn"
+DECODER_CROSS_PE="none"
+DECODER_CROSS_ATTN_LOCAL_RADIUS="-1"
 EMBED_MODE="joint"
 PATCH_SIZE="3"
 
@@ -36,9 +38,9 @@ GPUS=1               # Number of GPUs requested. Also used as world_size.
 CPUS_PER_TASK=8      # CPU threads available to each training process.
 MEMORY="20G"         # Total memory for the job.
 TIME_LIMIT="20:00:00"
-JOB_NAME="bioconstraints-train"
+JOB_NAME="compression-pe"
 SLURM_LOG_DIR="${SCRIPT_DIR}/checkpoints/${CHECKPOINT_DIR}"
-MASTER_PORT="8500"
+MASTER_PORT="8501"
 MODULE_PYTORCH="PyTorch/2.1.2-foss-2023a-CUDA-12.1.1"
 MODULE_EINOPS="einops/0.7.0-GCCcore-12.3.0"
 MODULE_TIMM="timm/1.0.3-foss-2023a-CUDA-12.1.1"
@@ -170,7 +172,10 @@ TRAIN_ARGS=(
     "--num_joints" "17"
     "--pruning_strategy" "learned"
     "--patch_size" "${PATCH_SIZE}"
+    "--chunking_scheme" "even"
     "--decoder_mode" "${DECODER_MODE}"
+    "--decoder_cross_pe" "${DECODER_CROSS_PE}"
+    "--decoder_cross_attn_local_radius" "${DECODER_CROSS_ATTN_LOCAL_RADIUS}"
     "--embed_mode" "${EMBED_MODE}"
     "--drop_rate" "0.0"
     "--attn_drop_rate" "0.0"
