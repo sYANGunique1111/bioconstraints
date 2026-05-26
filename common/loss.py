@@ -307,6 +307,12 @@ H36M_CHILDREN = [
 H36M_LEFT_JOINTS = [4, 5, 6, 11, 12, 13]   # Left leg (hip, knee, ankle) + Left arm (shoulder, elbow, wrist)
 H36M_RIGHT_JOINTS = [1, 2, 3, 14, 15, 16]  # Right leg + Right arm
 
+# Bones to exclude from temporal length constancy:
+# - 0 is the root pseudo-bone (not a physical segment)
+# - 9 and 10 are the thorax->neck and neck->head segments, which are not treated
+#   as rigid limb bones for this constraint
+DEFAULT_TEMPORAL_BONE_IGNORE_JOINTS = (0, 9, 10)
+
 # Default joint angle limits in RADIANS [min, max]
 # Now correctly indexed: angle AT joint j is the angle formed by bones meeting at j
 # For joint j: angle between (parent->j) and (j->child)
@@ -517,6 +523,61 @@ def bone_length_loss(predicted, target, parents=None):
     return loss
 
 
+def temporal_bone_length_loss(predicted, parents=None, ignore_joints=None):
+    """
+    Penalize variation of bone lengths within each sequence.
+
+    For each sample and bone, compute the mean length across frames and penalize
+    deviations from that sequence-specific mean. This enforces temporal constancy
+    without forcing all subjects to share the same limb proportions.
+
+    Args:
+        predicted: Predicted 3D poses of shape (B, T, J, 3)
+        parents: List of parent indices (default: H36M_PARENTS)
+        ignore_joints: Joint indices whose associated bone lengths are excluded.
+                       By default this excludes:
+                       - root pseudo-bone (0)
+                       - thorax->neck (9)
+                       - neck->head (10)
+
+    Returns:
+        Scalar loss value (mean absolute deviation from per-sequence mean length)
+    """
+    if parents is None:
+        parents = H36M_PARENTS
+    if ignore_joints is None:
+        ignore_joints = DEFAULT_TEMPORAL_BONE_IGNORE_JOINTS
+
+    lengths = compute_bone_lengths(predicted, parents)
+    keep_joints = [j for j in range(lengths.shape[-1]) if j not in ignore_joints]
+
+    if len(keep_joints) == 0:
+        raise ValueError("temporal_bone_length_loss has no bones left after applying ignore_joints")
+
+    lengths = lengths[..., keep_joints]
+    mean_lengths = lengths.mean(dim=1, keepdim=True)
+    loss = torch.mean(torch.abs(lengths - mean_lengths))
+
+    return loss
+
+
+def _build_symmetric_bone_pairs(parents, left_joints, right_joints):
+    if len(left_joints) != len(right_joints):
+        raise ValueError("left_joints and right_joints must have the same length")
+
+    symmetric_bone_pairs = []
+    for left_joint, right_joint in zip(left_joints, right_joints):
+        left_parent = parents[left_joint]
+        right_parent = parents[right_joint]
+
+        if left_parent < 0 or right_parent < 0:
+            continue
+
+        symmetric_bone_pairs.append(((left_parent, left_joint), (right_parent, right_joint)))
+
+    return symmetric_bone_pairs
+
+
 def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
     """
     Compute symmetry loss using L1 (absolute difference).
@@ -548,6 +609,125 @@ def symmetry_loss(predicted, parents=None, left_joints=None, right_joints=None):
     loss = torch.mean(torch.abs(left_lengths - right_lengths))
     
     return loss
+
+
+def temporal_average_symmetry_loss(
+    predicted,
+    symmetric_bone_pairs=None,
+    tau=0.0005,
+    eps=1e-8,
+    parents=None,
+    left_joints=None,
+    right_joints=None,
+):
+    """
+    Compare temporal-average left/right bone lengths with a small margin.
+
+    Args:
+        predicted: Predicted 3D poses of shape (B, T, J, 3)
+        symmetric_bone_pairs: Optional list of bone-pair tuples in the format
+                              [((left_start, left_end), (right_start, right_end)), ...]
+        tau: Margin threshold in pose units. Default assumes meter-scale poses.
+        eps: Small value for numerical stability in bone-length norms.
+        parents: Parent indices used to derive default bone pairs when
+                 symmetric_bone_pairs is not provided.
+        left_joints: Left-side child-joint indices used with parents to derive
+                     default bone pairs.
+        right_joints: Right-side child-joint indices used with parents to derive
+                      default bone pairs.
+
+    Returns:
+        Scalar tensor.
+    """
+    assert predicted.ndim == 4, "predicted should have shape (B, T, J, 3)"
+    assert predicted.shape[-1] == 3, "last dimension should be 3D coordinates"
+
+    if symmetric_bone_pairs is None:
+        if parents is None:
+            parents = H36M_PARENTS
+        if left_joints is None:
+            left_joints = H36M_LEFT_JOINTS
+        if right_joints is None:
+            right_joints = H36M_RIGHT_JOINTS
+        symmetric_bone_pairs = _build_symmetric_bone_pairs(parents, left_joints, right_joints)
+
+    if len(symmetric_bone_pairs) == 0:
+        return predicted.new_tensor(0.0)
+
+    losses = []
+    for left_bone, right_bone in symmetric_bone_pairs:
+        left_start, left_end = left_bone
+        right_start, right_end = right_bone
+
+        left_vec = predicted[:, :, left_end, :] - predicted[:, :, left_start, :]
+        right_vec = predicted[:, :, right_end, :] - predicted[:, :, right_start, :]
+
+        left_len = torch.sqrt(torch.sum(left_vec ** 2, dim=-1) + eps)
+        right_len = torch.sqrt(torch.sum(right_vec ** 2, dim=-1) + eps)
+
+        left_mean = left_len.mean(dim=1)
+        right_mean = right_len.mean(dim=1)
+
+        losses.append(torch.relu(torch.abs(left_mean - right_mean) - tau))
+
+    return torch.stack(losses, dim=1).mean()
+
+
+def topk_joint_acceleration_loss(predicted, target, k=25, loss_type="smooth_l1", eps=1e-8):
+    """
+    Supervise predicted joint accelerations at the top-k predicted motion peaks.
+
+    Args:
+        predicted: Predicted 3D poses of shape (B, T, J, 3)
+        target: Ground-truth 3D poses of shape (B, T, J, 3)
+        k: Number of joint-time acceleration entries selected per sample.
+        loss_type: One of {"smooth_l1", "l1", "mse", "l2_norm"}.
+        eps: Small value for numerical stability in L2 norms.
+
+    Returns:
+        Scalar tensor.
+    """
+    import torch.nn.functional as F
+
+    assert predicted.ndim == 4, "predicted should have shape (B, T, J, 3)"
+    assert target.ndim == 4, "target should have shape (B, T, J, 3)"
+    assert predicted.shape == target.shape, "predicted and target must have the same shape"
+    assert predicted.shape[-1] == 3, "last dimension should be 3D coordinates"
+
+    batch_size, num_frames, _, num_coords = predicted.shape
+
+    if num_frames < 3 or k <= 0:
+        return predicted.new_tensor(0.0)
+
+    predicted_acc = predicted[:, 2:, :, :] - 2.0 * predicted[:, 1:-1, :, :] + predicted[:, :-2, :, :]
+    target_acc = target[:, 2:, :, :] - 2.0 * target[:, 1:-1, :, :] + target[:, :-2, :, :]
+
+    predicted_acc_mag = torch.sqrt(torch.sum(predicted_acc ** 2, dim=-1) + eps)
+    predicted_acc_mag_flat = predicted_acc_mag.reshape(batch_size, -1)
+
+    num_entries = predicted_acc_mag_flat.shape[1]
+    k = min(k, num_entries)
+
+    _, topk_idx = torch.topk(predicted_acc_mag_flat, k=k, dim=1, largest=True, sorted=False)
+
+    predicted_acc_flat = predicted_acc.reshape(batch_size, num_entries, num_coords)
+    target_acc_flat = target_acc.reshape(batch_size, num_entries, num_coords)
+    gather_idx = topk_idx.unsqueeze(-1).expand(-1, -1, num_coords)
+
+    selected_predicted_acc = torch.gather(predicted_acc_flat, dim=1, index=gather_idx)
+    selected_target_acc = torch.gather(target_acc_flat, dim=1, index=gather_idx)
+    diff = selected_predicted_acc - selected_target_acc
+
+    if loss_type == "smooth_l1":
+        return F.smooth_l1_loss(selected_predicted_acc, selected_target_acc, reduction="mean")
+    if loss_type == "l1":
+        return torch.abs(diff).mean()
+    if loss_type == "mse":
+        return torch.mean(diff ** 2)
+    if loss_type == "l2_norm":
+        return torch.sqrt(torch.sum(diff ** 2, dim=-1) + eps).mean()
+
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
 
 
 def joint_angle_loss(predicted, parents=None, angle_limits=None):
@@ -605,7 +785,9 @@ def joint_angle_loss(predicted, parents=None, angle_limits=None):
 
 
 def biomechanical_loss(predicted, target, parents=None, left_joints=None, right_joints=None,
-                       angle_limits=None, weight_bone=0.1, weight_symmetry=0.05, weight_angle=0.01):
+                       angle_limits=None, weight_bone=0.1, weight_symmetry=0.05,
+                       weight_angle=0.01, weight_temporal_bone=0.0,
+                       temporal_bone_ignore_joints=None):
     """
     Compute combined biomechanical loss.
     
@@ -619,6 +801,9 @@ def biomechanical_loss(predicted, target, parents=None, left_joints=None, right_
         weight_bone: Weight for bone length loss
         weight_symmetry: Weight for symmetry loss
         weight_angle: Weight for joint angle loss
+        weight_temporal_bone: Weight for temporal bone length constancy loss
+        temporal_bone_ignore_joints: Joint indices to exclude from temporal bone
+                                     length constancy
         
     Returns:
         total_loss: Combined weighted biomechanical loss
@@ -631,16 +816,21 @@ def biomechanical_loss(predicted, target, parents=None, left_joints=None, right_
     loss_bone = bone_length_loss(predicted, target, parents)
     loss_sym = symmetry_loss(predicted, parents, left_joints, right_joints)
     loss_angle = joint_angle_loss(predicted, parents, angle_limits)
+    loss_temporal_bone = temporal_bone_length_loss(
+        predicted, parents, ignore_joints=temporal_bone_ignore_joints
+    )
     
     # Weighted combination
     total_loss = (weight_bone * loss_bone + 
                   weight_symmetry * loss_sym + 
-                  weight_angle * loss_angle)
+                  weight_angle * loss_angle +
+                  weight_temporal_bone * loss_temporal_bone)
     
     loss_dict = {
         'bone_length': loss_bone.item(),
         'symmetry': loss_sym.item(),
         'joint_angle': loss_angle.item(),
+        'temporal_bone_length': loss_temporal_bone.item(),
         'biomech_total': total_loss.item()
     }
     

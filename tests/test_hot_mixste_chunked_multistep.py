@@ -97,6 +97,41 @@ def test_single_stage_one_step_interp_cubic_forward_cpu():
     assert y.shape == (1, 243, 17, 3)
 
 
+def test_feature_interp_attn_identifier_ids_match_interpolation_grid():
+    identifier_ids = ChunkedCompressionModel._build_interp_identifier_ids(
+        token_num=81,
+        recover_num=243,
+    )
+    anchor_indices = torch.nonzero(identifier_ids[0] == 0, as_tuple=False).flatten()
+    expected = (
+        (torch.arange(81, dtype=torch.float32) * (243 - 1) / (81 - 1))
+        .round()
+        .to(torch.long)
+    )
+
+    assert identifier_ids.shape == (1, 243)
+    assert int((identifier_ids == 0).sum().item()) == 81
+    assert int((identifier_ids == 1).sum().item()) == 162
+    assert torch.equal(anchor_indices, expected)
+
+
+def test_single_stage_feature_interp_attn_registers_identifier_embedding():
+    model = ChunkedCompressionModel(
+        _build_args(
+            token_num=81,
+            layer_index=1,
+            decoder_mode="feature_interp_attn",
+            chunking_scheme="even",
+            channel=8,
+        )
+    ).eval()
+
+    assert model.feature_interp_attn_identifier_embed.num_embeddings == 2
+    assert model.feature_interp_attn_identifier_embed.embedding_dim == 8
+    assert model.feature_interp_attn_identifier_ids.shape == (1, 243)
+    assert int((model.feature_interp_attn_identifier_ids == 0).sum().item()) == 81
+
+
 def test_single_stage_ut_insert_anchor_indices_even_chunk_centers():
     anchor_indices = ChunkedCompressionModel._build_ut_anchor_indices(
         recover_num=243,
@@ -142,6 +177,23 @@ def test_single_stage_ut_insert_attention_forward_cpu():
             token_num=81,
             layer_index=1,
             decoder_mode="ut_insert_attention",
+            chunking_scheme="even",
+        )
+    ).eval()
+    x = torch.randn(1, 243, 17, 2)
+
+    with torch.no_grad():
+        y = model(x)
+
+    assert y.shape == (1, 243, 17, 3)
+
+
+def test_single_stage_feature_interp_attn_forward_cpu():
+    model = ChunkedCompressionModel(
+        _build_args(
+            token_num=81,
+            layer_index=1,
+            decoder_mode="feature_interp_attn",
             chunking_scheme="even",
         )
     ).eval()

@@ -23,7 +23,14 @@ from torch.utils.data.distributed import DistributedSampler
 from common.arguments import parse_args
 from common.camera import normalize_screen_coordinates, world_to_camera
 from common.generators import ChunkedGenerator, UnchunkedGenerator
-from common.loss import fweighted_mpjpe, mpjpe, p_mpjpe
+from common.loss import (
+    fweighted_mpjpe,
+    mpjpe,
+    p_mpjpe,
+    temporal_average_symmetry_loss,
+    temporal_bone_length_loss,
+    topk_joint_acceleration_loss,
+)
 from models.mixste import (
     MixSTE2,
     HybridJointWiseMixSTE,
@@ -524,6 +531,9 @@ def runner(rank, args, train_data, test_data):
     losses_train = []
     losses_valid = []
     losses_p_valid = []
+    losses_temporal_bone = []
+    losses_temporal_symmetry = []
+    losses_joint_acc = []
 
     epoch = 0
     
@@ -575,6 +585,9 @@ def runner(rank, args, train_data, test_data):
         start_time = time.time()
         epoch_loss_train = 0
         epoch_loss_train_ortho = 0
+        epoch_loss_train_temporal_bone = 0
+        epoch_loss_train_temporal_symmetry = 0
+        epoch_loss_train_joint_acc = 0
         N = 0
 
         model_pos.train()
@@ -592,19 +605,50 @@ def runner(rank, args, train_data, test_data):
                 gather_idx = kept_indices[:, :, None, None].expand(-1, -1, inputs_3d.shape[2], inputs_3d.shape[3])
                 target_3d_pruned = torch.gather(inputs_3d, 1, gather_idx)
                 mpjpe_loss = train_loss_fn(pre_interp_3d, target_3d_pruned)
+                temporal_bone_loss = temporal_bone_length_loss(pre_interp_3d)
+                temporal_symmetry_loss = temporal_average_symmetry_loss(
+                    pre_interp_3d,
+                    tau=args.temporal_symmetry_tau,
+                )
+                joint_acc_loss = topk_joint_acceleration_loss(
+                    pre_interp_3d,
+                    target_3d_pruned,
+                    k=args.joint_acc_topk,
+                    loss_type=args.joint_acc_loss_type,
+                )
                 ortho_loss = None
             else:
                 predicted_3d = model_pos(inputs_2d)
                 mpjpe_loss = train_loss_fn(predicted_3d, inputs_3d)
+                temporal_bone_loss = temporal_bone_length_loss(predicted_3d)
+                temporal_symmetry_loss = temporal_average_symmetry_loss(
+                    predicted_3d,
+                    tau=args.temporal_symmetry_tau,
+                )
+                joint_acc_loss = topk_joint_acceleration_loss(
+                    predicted_3d,
+                    inputs_3d,
+                    k=args.joint_acc_topk,
+                    loss_type=args.joint_acc_loss_type,
+                )
                 ortho_loss = getattr(model_pos.module, 'latest_chunk_ortho_loss', None)
 
             loss = mpjpe_loss
+            if args.weight_temporal_bone > 0.0:
+                loss = loss + args.weight_temporal_bone * temporal_bone_loss
+            if args.weight_temporal_symmetry > 0.0:
+                loss = loss + args.weight_temporal_symmetry * temporal_symmetry_loss
+            if args.weight_joint_acc > 0.0:
+                loss = loss + args.weight_joint_acc * joint_acc_loss
             if ortho_loss is not None and getattr(model_pos.module, 'lambda_chunk_ortho', 0.0) > 0.0:
                 loss = loss + model_pos.module.lambda_chunk_ortho * ortho_loss
 
             loss.backward()
 
             epoch_loss_train += inputs_3d.shape[0] * inputs_3d.shape[1] * mpjpe_loss.item()
+            epoch_loss_train_temporal_bone += inputs_3d.shape[0] * inputs_3d.shape[1] * temporal_bone_loss.item()
+            epoch_loss_train_temporal_symmetry += inputs_3d.shape[0] * inputs_3d.shape[1] * temporal_symmetry_loss.item()
+            epoch_loss_train_joint_acc += inputs_3d.shape[0] * inputs_3d.shape[1] * joint_acc_loss.item()
             if ortho_loss is not None:
                 epoch_loss_train_ortho += inputs_3d.shape[0] * inputs_3d.shape[1] * ortho_loss.item()
             N += inputs_3d.shape[0] * inputs_3d.shape[1]
@@ -612,6 +656,9 @@ def runner(rank, args, train_data, test_data):
             optimizer.step()
 
         losses_train.append(epoch_loss_train / N)
+        losses_temporal_bone.append(epoch_loss_train_temporal_bone / N)
+        losses_temporal_symmetry.append(epoch_loss_train_temporal_symmetry / N)
+        losses_joint_acc.append(epoch_loss_train_joint_acc / N)
         torch.cuda.empty_cache()
 
         # Validation
@@ -646,11 +693,35 @@ def runner(rank, args, train_data, test_data):
         elapsed = (time.time() - start_time) / 60
         
         if dist.get_rank() == args.reduce_rank:
-            print(f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} train {losses_train[-1]*1000:.3f}mm valid {losses_valid[-1]*1000:.3f}mm PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm')
+            log_line = (
+                f'[{epoch + 1}] time {elapsed:.2f}min lr {lr:.6f} '
+                f'train {losses_train[-1]*1000:.3f}mm '
+                f'valid {losses_valid[-1]*1000:.3f}mm '
+                f'PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm'
+            )
+            if args.weight_temporal_bone > 0.0:
+                log_line += f' tbone {losses_temporal_bone[-1]:.6f}'
+            if args.weight_temporal_symmetry > 0.0:
+                log_line += f' tsym {losses_temporal_symmetry[-1]:.6f}'
+            if args.weight_joint_acc > 0.0:
+                log_line += f' jacc {losses_joint_acc[-1]:.6f}'
+            print(log_line)
 
             log_path = os.path.join(args.checkpoint, 'training_log.txt')
             with open(log_path, mode='a') as f:
-                f.write(f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} train {losses_train[-1]*1000:.3f} valid {losses_valid[-1]*1000:.3f} PA-MPJPE {losses_p_valid[-1]*1000:.3f}\n')
+                log_line = (
+                    f'[{epoch + 1}] time {elapsed:.2f} lr {lr:.6f} '
+                    f'train {losses_train[-1]*1000:.3f} '
+                    f'valid {losses_valid[-1]*1000:.3f} '
+                    f'PA-MPJPE {losses_p_valid[-1]*1000:.3f}'
+                )
+                if args.weight_temporal_bone > 0.0:
+                    log_line += f' tbone {losses_temporal_bone[-1]:.6f}'
+                if args.weight_temporal_symmetry > 0.0:
+                    log_line += f' tsym {losses_temporal_symmetry[-1]:.6f}'
+                if args.weight_joint_acc > 0.0:
+                    log_line += f' jacc {losses_joint_acc[-1]:.6f}'
+                f.write(log_line + '\n')
             
             # W&B logging
             if args.wandb:
@@ -664,6 +735,18 @@ def runner(rank, args, train_data, test_data):
                     "best_valid_loss": min_loss,
                     "time_per_epoch": elapsed
                 }
+                if args.weight_temporal_bone > 0.0:
+                    log_dict["train_temporal_bone_length"] = losses_temporal_bone[-1]
+                    log_dict["weight_temporal_bone"] = args.weight_temporal_bone
+                if args.weight_temporal_symmetry > 0.0:
+                    log_dict["train_temporal_symmetry"] = losses_temporal_symmetry[-1]
+                    log_dict["weight_temporal_symmetry"] = args.weight_temporal_symmetry
+                    log_dict["temporal_symmetry_tau"] = args.temporal_symmetry_tau
+                if args.weight_joint_acc > 0.0:
+                    log_dict["train_joint_acc"] = losses_joint_acc[-1]
+                    log_dict["weight_joint_acc"] = args.weight_joint_acc
+                    log_dict["joint_acc_topk"] = args.joint_acc_topk
+                    log_dict["joint_acc_loss_type"] = args.joint_acc_loss_type
                 if args.use_chunk_ortho_loss:
                     log_dict["train_chunk_ortho_loss"] = epoch_loss_train_ortho / N
                 
@@ -799,11 +882,13 @@ def main(args):
         train_data = ChunkedGenerator(
             args.batch_size // args.number_of_frames, cameras_train, poses_train, poses_train_2d,
             args.number_of_frames, pad=0, causal_shift=0, shuffle=True, augment=args.data_augmentation,
-            kps_left=kps_left, kps_right=kps_right, joints_left=joints_left, joints_right=joints_right)
+            kps_left=kps_left, kps_right=kps_right, joints_left=joints_left, joints_right=joints_right,
+            chunk_mode=args.sequence_chunk_mode)
         
         test_data = ChunkedGenerator(
             args.batch_size // args.number_of_frames, cameras_test, poses_test, poses_test_2d,
-            args.number_of_frames, pad=0, causal_shift=0, shuffle=False, augment=False)
+            args.number_of_frames, pad=0, causal_shift=0, shuffle=False, augment=False,
+            chunk_mode=args.sequence_chunk_mode)
 
         print(f'INFO: Training on {train_data.num_frames()} frames')
         print(f'INFO: Testing on {test_data.num_frames()} frames')

@@ -9,6 +9,7 @@ import os
 import yaml
 import argparse
 import numpy as np
+import gc
 
 import torch
 from torch.utils.data import DataLoader
@@ -59,8 +60,29 @@ def fetch(keypoints, dataset, subjects, action_filter=None):
     return out_camera_params, out_poses_3d, out_poses_2d
 
 
-def load_dataset_and_keypoints(config):
-    dataset_root = "/data/shuoyang67/dataset/H36m/annot"
+def resolve_dataset_root(explicit_root=None):
+    if explicit_root:
+        return explicit_root
+
+    env_root = os.environ.get("H36M_DATASET_ROOT")
+    if env_root:
+        return env_root
+
+    candidates = [
+        "/FARM/syangb/data/h36m",
+        "/data/shuoyang67/dataset/H36m/annot",
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not resolve dataset root. Pass --dataset_root or set H36M_DATASET_ROOT."
+    )
+
+
+def load_dataset_and_keypoints(config, dataset_root=None):
+    dataset_root = resolve_dataset_root(dataset_root)
     dataset_name = config.get("dataset", "h36m")
 
     dataset_path = f"{dataset_root}/data_3d_{dataset_name}.npz"
@@ -179,8 +201,12 @@ def build_model_from_config(config):
         raise NotImplementedError(f"Model '{model_name}' is not yet implemented in evaluate.py.")
 
 
-def evaluate(args):
-    checkpoint_dir = args.checkpoint
+def evaluate_checkpoint(checkpoint_dir, batch_size=None, sequence_chunk_mode=None, dataset_root=None, action_wise=True):
+    model = None
+    checkpoint_data = None
+    dataset = None
+    keypoints = None
+    result = None
     config_path = os.path.join(checkpoint_dir, "config.yaml")
     
     if not os.path.exists(config_path):
@@ -191,110 +217,198 @@ def evaluate(args):
 
     if 'dataset' not in config:
         config['dataset'] = 'h36m'
+
+    effective_chunk_mode = sequence_chunk_mode or config.get("sequence_chunk_mode", "center_pad")
     
     print(f"Checkpoint: {checkpoint_dir}")
     print(f"Model: {config.get('model')}")
+    print(f"Sequence chunk mode: {effective_chunk_mode}")
     
-    model = build_model_from_config(config)
-    
-    weights_path = os.path.join(checkpoint_dir, "best_epoch.bin")
-    if not os.path.exists(weights_path):
-        print(f"Warning: {weights_path} not found. Trying to find any .bin file...")
-        bins = [f for f in os.listdir(checkpoint_dir) if f.endswith('.bin')]
-        if bins:
-            weights_path = os.path.join(checkpoint_dir, bins[0])
+    try:
+        model = build_model_from_config(config)
+        
+        weights_path = os.path.join(checkpoint_dir, "best_epoch.bin")
+        if not os.path.exists(weights_path):
+            print(f"Warning: {weights_path} not found. Trying to find any .bin file...")
+            bins = [f for f in os.listdir(checkpoint_dir) if f.endswith('.bin')]
+            if bins:
+                weights_path = os.path.join(checkpoint_dir, bins[0])
+            else:
+                raise FileNotFoundError("No checkpoint .bin file found.")
+                
+        print(f"Loading weights from: {weights_path}")
+        checkpoint_data = torch.load(weights_path, map_location="cpu")
+        
+        state_dict = checkpoint_data.get("model_pos", checkpoint_data)
+        clean_state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+        model.load_state_dict(clean_state_dict)
+        del clean_state_dict
+        del state_dict
+        del checkpoint_data
+        checkpoint_data = None
+        
+        model = model.cuda()
+        model.eval()
+
+        print("Loading test dataset and keypoints...")
+        dataset, keypoints, subjects_test, action_prefixes = load_dataset_and_keypoints(config, dataset_root=dataset_root)
+        
+        action_results = []
+        if action_wise:
+            eval_groups = action_prefixes
+            print("\nStarting action-wise evaluation...")
+            print("-" * 60)
+            print(f"{'Action':<20} | {'MPJPE (mm)':<15} | {'PA-MPJPE (mm)':<15}")
+            print("-" * 60)
         else:
-            raise FileNotFoundError("No checkpoint .bin file found.")
-            
-    print(f"Loading weights from: {weights_path}")
-    checkpoint_data = torch.load(weights_path, map_location="cpu")
-    
-    state_dict = checkpoint_data.get("model_pos", checkpoint_data)
-    clean_state_dict = {k.replace("module.", "", 1): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state_dict)
-    
-    model = model.cuda()
-    model.eval()
+            eval_groups = [None]
+            print("\nStarting aggregate evaluation on all test actions...")
 
-    print("Loading test dataset and keypoints...")
-    dataset, keypoints, subjects_test, action_prefixes = load_dataset_and_keypoints(config)
-    
-    # Store per-action metrics
-    action_mpjpes = []
-    action_p_mpjpes = []
-    
-    print("\nStarting action-wise evaluation...")
-    print("-" * 60)
-    print(f"{'Action':<20} | {'MPJPE (mm)':<15} | {'PA-MPJPE (mm)':<15}")
-    print("-" * 60)
+        with torch.inference_mode():
+            total_eval_mpjpe = 0.0
+            total_eval_p_mpjpe = 0.0
+            total_eval_frames = 0
 
-    with torch.no_grad():
-        for action in action_prefixes:
-            cameras_test, poses_test, poses_test_2d = fetch(keypoints, dataset, subjects_test, action_filter=[action])
-            if poses_test is None:
-                continue
+            for action in eval_groups:
+                action_filter = [action] if action_wise else None
+                cameras_test, poses_test, poses_test_2d = fetch(keypoints, dataset, subjects_test, action_filter=action_filter)
+                if poses_test is None:
+                    continue
+                    
+                test_data = ChunkedGenerator(
+                    config["batch_size"] // config["number_of_frames"],
+                    cameras_test, poses_test, poses_test_2d,
+                    config["number_of_frames"],
+                    pad=0, causal_shift=0, shuffle=False, augment=False,
+                    chunk_mode=effective_chunk_mode,
+                )
                 
-            test_data = ChunkedGenerator(
-                config["batch_size"] // config["number_of_frames"],
-                cameras_test, poses_test, poses_test_2d,
-                config["number_of_frames"],
-                pad=0, causal_shift=0, shuffle=False, augment=False,
-            )
-            
-            test_loader = DataLoader(
-                test_data,
-                batch_size=args.batch_size if args.batch_size else max(1, config["batch_size"] // config["number_of_frames"]),
-                shuffle=False,
-                num_workers=config.get("num_workers", 4),
-                pin_memory=True,
-            )
-            
-            total_mpjpe = 0.0
-            total_p_mpjpe = 0.0
-            N = 0
-            
-            for batch_idx, (_, inputs_3d, inputs_2d) in enumerate(test_loader):
-                inputs_2d = inputs_2d.cuda().float()
-                inputs_3d = inputs_3d.cuda().float()
-                inputs_3d[:, :, 0] = 0
+                test_loader = DataLoader(
+                    test_data,
+                    batch_size=batch_size if batch_size else max(1, config["batch_size"] // config["number_of_frames"]),
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=True,
+                )
+                
+                total_mpjpe = 0.0
+                total_p_mpjpe = 0.0
+                N = 0
+                
+                for _, inputs_3d, inputs_2d in test_loader:
+                    inputs_2d = inputs_2d.cuda(non_blocking=True).float()
+                    inputs_3d = inputs_3d.cuda(non_blocking=True).float()
+                    inputs_3d[:, :, 0] = 0
 
-                predicted_3d = model(inputs_2d)
-                predicted_3d[:, :, 0] = 0
-                
-                error = mpjpe(predicted_3d, inputs_3d).item()
-                p_error = p_mpjpe(predicted_3d.cpu().numpy(), inputs_3d.cpu().numpy())
+                    predicted_3d = model(inputs_2d)
+                    predicted_3d[:, :, 0] = 0
+                    
+                    error = mpjpe(predicted_3d, inputs_3d).item()
+                    p_error = p_mpjpe(predicted_3d.cpu().numpy(), inputs_3d.cpu().numpy())
 
-                batch_size = inputs_3d.shape[0] * inputs_3d.shape[1]
-                total_mpjpe += error * batch_size
-                total_p_mpjpe += p_error * batch_size
-                N += batch_size
-                
-            if N > 0:
-                avg_mpjpe = (total_mpjpe / N) * 1000
-                avg_p_mpjpe = (total_p_mpjpe / N) * 1000
-                
-                action_mpjpes.append(avg_mpjpe)
-                action_p_mpjpes.append(avg_p_mpjpe)
-                
-                print(f"{action:<20} | {avg_mpjpe:<15.3f} | {avg_p_mpjpe:<15.3f}")
+                    frame_count = inputs_3d.shape[0] * inputs_3d.shape[1]
+                    total_mpjpe += error * frame_count
+                    total_p_mpjpe += p_error * frame_count
+                    N += frame_count
 
-    print("-" * 60)
-    
-    # Calculate unweighted averages across all action categories
-    overall_mpjpe = np.mean(action_mpjpes)
-    overall_p_mpjpe = np.mean(action_p_mpjpes)
-    
-    print("\n" + "=" * 50)
-    print("Action-wise Unweighted Average Results (matching DiffCardGCN evaluation):")
-    print(f"  MPJPE:    {overall_mpjpe:.3f} mm")
-    print(f"  PA-MPJPE: {overall_p_mpjpe:.3f} mm")
-    print("=" * 50 + "\n")
+                    del predicted_3d
+                    del inputs_2d
+                    del inputs_3d
+                    
+                del test_loader
+                del test_data
+                del cameras_test
+                del poses_test
+                del poses_test_2d
+                
+                if N > 0:
+                    avg_mpjpe = (total_mpjpe / N) * 1000
+                    avg_p_mpjpe = (total_p_mpjpe / N) * 1000
+
+                    total_eval_mpjpe += total_mpjpe
+                    total_eval_p_mpjpe += total_p_mpjpe
+                    total_eval_frames += N
+                    
+                    if action_wise:
+                        action_results.append(
+                            {
+                                "action": action,
+                                "mpjpe_mm": avg_mpjpe,
+                                "pa_mpjpe_mm": avg_p_mpjpe,
+                            }
+                        )
+                        print(f"{action:<20} | {avg_mpjpe:<15.3f} | {avg_p_mpjpe:<15.3f}")
+
+        if action_wise:
+            print("-" * 60)
+
+        overall_mpjpe = (total_eval_mpjpe / total_eval_frames) * 1000
+        overall_p_mpjpe = (total_eval_p_mpjpe / total_eval_frames) * 1000
+        
+        print("\n" + "=" * 50)
+        if action_wise:
+            print("Overall frame-weighted results across all evaluated action chunks:")
+        else:
+            print("Aggregate results across all test actions:")
+        print(f"  MPJPE:    {overall_mpjpe:.3f} mm")
+        print(f"  PA-MPJPE: {overall_p_mpjpe:.3f} mm")
+        print("=" * 50 + "\n")
+
+        result = {
+            "checkpoint": checkpoint_dir,
+            "model": config.get("model"),
+            "sequence_chunk_mode": effective_chunk_mode,
+            "action_wise": action_wise,
+            "mpjpe_mm": float(overall_mpjpe),
+            "pa_mpjpe_mm": float(overall_p_mpjpe),
+            "actions": action_results,
+        }
+        return result
+    finally:
+        if model is not None:
+            model.cpu()
+        del model
+        del checkpoint_data
+        del dataset
+        del keypoints
+        del result
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def evaluate(args):
+    return evaluate_checkpoint(
+        checkpoint_dir=args.checkpoint,
+        batch_size=args.batch_size,
+        sequence_chunk_mode=args.sequence_chunk_mode,
+        dataset_root=args.dataset_root,
+        action_wise=not args.aggregate_only,
+    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate a trained Checkpoint with Action-wise breakdowns")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint directory")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size for dataloader (optional)")
+    parser.add_argument(
+        "--sequence_chunk_mode",
+        type=str,
+        default=None,
+        choices=["drop", "center_pad", "tail_pad", "stride"],
+        help="Override the sequence chunking mode used at evaluation time",
+    )
+    parser.add_argument(
+        "--dataset_root",
+        type=str,
+        default=None,
+        help="Optional H36M dataset root; defaults to H36M_DATASET_ROOT or known local paths",
+    )
+    parser.add_argument(
+        "--aggregate_only",
+        action="store_true",
+        help="Skip per-action breakdown and evaluate all test actions together",
+    )
     args = parser.parse_args()
     
     torch.backends.cudnn.deterministic = True

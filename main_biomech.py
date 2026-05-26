@@ -170,7 +170,7 @@ def runner(rank, args, train_data, test_data):
     losses_p_valid = []
     
     # Biomechanical loss tracking
-    biomech_losses_train = {'bone_length': [], 'symmetry': [], 'joint_angle': []}
+    biomech_losses_train = {'bone_length': [], 'symmetry': [], 'joint_angle': [], 'temporal_bone_length': []}
 
     epoch = 0
     
@@ -188,7 +188,11 @@ def runner(rank, args, train_data, test_data):
         print(f'INFO: Model: {model_class_name} | Trainable parameters: {model_params/1e6:.3f} Million')
         
         print(f'INFO: Warmup epochs: {args.warmup_epochs} (biomech weights ramp from 0 to target)')
-        print(f'INFO: Biomech loss weights - bone: {args.weight_bone}, sym: {args.weight_symmetry}, angle: {args.weight_angle}')
+        print(
+            f'INFO: Biomech loss weights - bone: {args.weight_bone}, '
+            f'sym: {args.weight_symmetry}, angle: {args.weight_angle}, '
+            f'temporal_bone: {args.weight_temporal_bone}'
+        )
         
         # Compute and log MACs/FLOPs
         macs = compute_flops(model_pos.module, args)
@@ -205,7 +209,8 @@ def runner(rank, args, train_data, test_data):
                 'biomech_weights': {
                     'bone': args.weight_bone,
                     'symmetry': args.weight_symmetry,
-                    'angle': args.weight_angle
+                    'angle': args.weight_angle,
+                    'temporal_bone': args.weight_temporal_bone,
                 }
             }
             with open(metrics_path, 'w') as f:
@@ -230,7 +235,7 @@ def runner(rank, args, train_data, test_data):
         start_time = time.time()
         epoch_loss_train = 0
         epoch_loss_mpjpe = 0
-        epoch_biomech = {'bone_length': 0, 'symmetry': 0, 'joint_angle': 0}
+        epoch_biomech = {'bone_length': 0, 'symmetry': 0, 'joint_angle': 0, 'temporal_bone_length': 0}
         
         # Compute warm-up scale factor: 0 at epoch 0, reaches 1.0 at end of warmup_epochs
         if args.warmup_epochs > 0:
@@ -242,6 +247,7 @@ def runner(rank, args, train_data, test_data):
         cur_weight_bone = args.weight_bone * scale
         cur_weight_sym = args.weight_symmetry * scale
         cur_weight_angle = args.weight_angle * scale
+        cur_weight_temporal_bone = args.weight_temporal_bone * scale
         N = 0
 
         model_pos.train()
@@ -270,7 +276,8 @@ def runner(rank, args, train_data, test_data):
                 angle_limits=skeleton_info['angle_limits'],
                 weight_bone=cur_weight_bone,
                 weight_symmetry=cur_weight_sym,
-                weight_angle=cur_weight_angle
+                weight_angle=cur_weight_angle,
+                weight_temporal_bone=cur_weight_temporal_bone,
             )
             
             # Total loss
@@ -286,6 +293,7 @@ def runner(rank, args, train_data, test_data):
             epoch_biomech['bone_length'] += batch_size * loss_dict['bone_length']
             epoch_biomech['symmetry'] += batch_size * loss_dict['symmetry']
             epoch_biomech['joint_angle'] += batch_size * loss_dict['joint_angle']
+            epoch_biomech['temporal_bone_length'] += batch_size * loss_dict['temporal_bone_length']
             N += batch_size
 
             optimizer.step()
@@ -294,6 +302,7 @@ def runner(rank, args, train_data, test_data):
         biomech_losses_train['bone_length'].append(epoch_biomech['bone_length'] / N)
         biomech_losses_train['symmetry'].append(epoch_biomech['symmetry'] / N)
         biomech_losses_train['joint_angle'].append(epoch_biomech['joint_angle'] / N)
+        biomech_losses_train['temporal_bone_length'].append(epoch_biomech['temporal_bone_length'] / N)
         torch.cuda.empty_cache()
 
         # Validation
@@ -336,7 +345,8 @@ def runner(rank, args, train_data, test_data):
                   f'PA-MPJPE {losses_p_valid[-1]*1000:.3f}mm '
                   f'bone {biomech_losses_train["bone_length"][-1]:.6f} '
                   f'sym {biomech_losses_train["symmetry"][-1]:.6f} '
-                  f'angle {biomech_losses_train["joint_angle"][-1]:.4f}')
+                  f'angle {biomech_losses_train["joint_angle"][-1]:.4f} '
+                  f'tbone {biomech_losses_train["temporal_bone_length"][-1]:.6f}')
 
             log_path = os.path.join(args.checkpoint, 'training_log.txt')
             with open(log_path, mode='a') as f:
@@ -346,7 +356,8 @@ def runner(rank, args, train_data, test_data):
                        f'PA-MPJPE {losses_p_valid[-1]*1000:.3f} '
                        f'bone {biomech_losses_train["bone_length"][-1]:.6f} '
                        f'sym {biomech_losses_train["symmetry"][-1]:.6f} '
-                       f'angle {biomech_losses_train["joint_angle"][-1]:.4f}\n')
+                       f'angle {biomech_losses_train["joint_angle"][-1]:.4f} '
+                       f'tbone {biomech_losses_train["temporal_bone_length"][-1]:.6f}\n')
             
             # W&B logging
             if args.wandb:
@@ -363,10 +374,12 @@ def runner(rank, args, train_data, test_data):
                     "biomech/bone_length": biomech_losses_train["bone_length"][-1],
                     "biomech/symmetry": biomech_losses_train["symmetry"][-1],
                     "biomech/joint_angle": biomech_losses_train["joint_angle"][-1],
+                    "biomech/temporal_bone_length": biomech_losses_train["temporal_bone_length"][-1],
                     "warmup/scale": scale,
                     "warmup/cur_weight_bone": cur_weight_bone,
                     "warmup/cur_weight_symmetry": cur_weight_sym,
                     "warmup/cur_weight_angle": cur_weight_angle,
+                    "warmup/cur_weight_temporal_bone": cur_weight_temporal_bone,
                 }
                 
                 if epoch in gradient_epochs:

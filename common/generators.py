@@ -12,7 +12,7 @@ import numpy as np
 class ChunkedGenerator(Dataset):
     """
     Batched data generator, used for training.
-    The sequences are split into equal-length chunks and padded as necessary.
+    The sequences are split into equal-length chunks according to the selected chunking mode.
     
     Arguments:
     batch_size -- the batch size to use for training
@@ -32,22 +32,49 @@ class ChunkedGenerator(Dataset):
                  chunk_length, pad=0, causal_shift=0,
                  shuffle=True, random_seed=1234,
                  augment=False, kps_left=None, kps_right=None, joints_left=None, joints_right=None,
-                 endless=False):
+                 endless=False, chunk_mode='center_pad'):
         assert poses_3d is None or len(poses_3d) == len(poses_2d), (len(poses_3d), len(poses_2d))
         if cameras is not None:
             assert cameras is None or len(cameras) == len(poses_2d)
+        if chunk_mode not in {'drop', 'center_pad', 'tail_pad', 'stride'}:
+            raise ValueError(f'Unsupported chunk_mode: {chunk_mode}')
     
         # Build lineage info
         pairs = []  # (seq_idx, start_frame, end_frame, flip) tuples
         for i in range(len(poses_2d)):
             assert poses_3d is None or poses_2d[i].shape[0] == poses_3d[i].shape[0]
-            n_chunks = (poses_2d[i].shape[0] + chunk_length - 1) // chunk_length
-            offset = (n_chunks * chunk_length - poses_2d[i].shape[0]) // 2
-            bounds = np.arange(n_chunks+1)*chunk_length - offset
-            augment_vector = np.full(len(bounds - 1), False, dtype=bool)
-            pairs += zip(np.repeat(i, len(bounds - 1)), bounds[:-1], bounds[1:], augment_vector)
+            seq_len = poses_2d[i].shape[0]
+            if chunk_mode == 'drop':
+                n_chunks = seq_len // chunk_length
+                bounds = np.arange(n_chunks + 1) * chunk_length
+            elif chunk_mode == 'center_pad':
+                n_chunks = (seq_len + chunk_length - 1) // chunk_length
+                offset = (n_chunks * chunk_length - seq_len) // 2
+                bounds = np.arange(n_chunks + 1) * chunk_length - offset
+            elif chunk_mode == 'tail_pad':
+                n_chunks = (seq_len + chunk_length - 1) // chunk_length
+                bounds = np.arange(n_chunks + 1) * chunk_length
+            else:  # stride
+                n_chunks = (seq_len + chunk_length - 1) // chunk_length
+                if n_chunks <= 1:
+                    bounds = np.array([0, chunk_length])
+                else:
+                    starts = np.rint(
+                        np.arange(n_chunks, dtype=np.float64) * (seq_len - chunk_length) / (n_chunks - 1)
+                    ).astype(int)
+                    bounds = np.column_stack((starts, starts + chunk_length))
+
+            if chunk_mode == 'stride':
+                augment_vector = np.full(bounds.shape[0], False, dtype=bool)
+                pairs += zip(np.repeat(i, bounds.shape[0]), bounds[:, 0], bounds[:, 1], augment_vector)
+            else:
+                augment_vector = np.full(len(bounds - 1), False, dtype=bool)
+                pairs += zip(np.repeat(i, len(bounds - 1)), bounds[:-1], bounds[1:], augment_vector)
             if augment:
-                pairs += zip(np.repeat(i, len(bounds - 1)), bounds[:-1], bounds[1:], ~augment_vector)
+                if chunk_mode == 'stride':
+                    pairs += zip(np.repeat(i, bounds.shape[0]), bounds[:, 0], bounds[:, 1], ~augment_vector)
+                else:
+                    pairs += zip(np.repeat(i, len(bounds - 1)), bounds[:-1], bounds[1:], ~augment_vector)
 
         self.num_batches = (len(pairs) + batch_size - 1) // batch_size
         self.chunk_length = chunk_length
@@ -59,6 +86,7 @@ class ChunkedGenerator(Dataset):
         self.causal_shift = causal_shift
         self.endless = endless
         self.state = None
+        self.chunk_mode = chunk_mode
         
         self.poses_3d = poses_3d
         self.poses_2d = poses_2d

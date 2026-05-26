@@ -684,6 +684,13 @@ class ChunkedCompressionModel(Model):
                 self.feature_interp_transform = nn.Linear(embed_dim, embed_dim)
             if self._effective_decoder_mode == 'feature_interp_affine_attn':
                 self.feature_interp_affine = nn.Linear(embed_dim, embed_dim)
+            if self._effective_decoder_mode == 'feature_interp_attn':
+                self.feature_interp_attn_identifier_embed = nn.Embedding(2, embed_dim)
+                self.register_buffer(
+                    "feature_interp_attn_identifier_ids",
+                    self._build_interp_identifier_ids(self.token_num, self.recover_num),
+                    persistent=False,
+                )
             if self._effective_decoder_mode in ('feature_interp_attn', 'feature_interp_affine_attn'):
                 self.register_buffer(
                     "feature_interp_attn_pos_embed",
@@ -924,6 +931,28 @@ class ChunkedCompressionModel(Model):
         return dense + self.decoder_ut_pos_embed.to(device=x.device, dtype=x.dtype)
 
     @staticmethod
+    def _build_interp_identifier_ids(token_num, recover_num):
+        if token_num <= 0 or recover_num <= 0:
+            raise ValueError(
+                f"token_num and recover_num must be positive, got token_num={token_num}, recover_num={recover_num}."
+            )
+
+        identifier_ids = torch.ones(1, recover_num, dtype=torch.long)
+        if token_num == 1:
+            identifier_ids[:, 0] = 0
+            return identifier_ids
+
+        anchor_positions = torch.arange(token_num, dtype=torch.float32) * (recover_num - 1) / (token_num - 1)
+        anchor_indices = anchor_positions.round().to(torch.long).clamp_(0, recover_num - 1).unique(sorted=True)
+        if anchor_indices.numel() != token_num:
+            raise ValueError(
+                "Interpolation anchor mapping collapsed source tokens onto duplicate recovered positions: "
+                f"token_num={token_num}, recover_num={recover_num}, unique_anchors={anchor_indices.numel()}."
+            )
+        identifier_ids[:, anchor_indices] = 0
+        return identifier_ids
+
+    @staticmethod
     def _temporal_resample(x, out_len, mode):
         b, _, n, c = x.shape
 
@@ -1107,6 +1136,9 @@ class ChunkedCompressionModel(Model):
             dense = self._temporal_resample(x, self.recover_num, "linear")
             dense = rearrange(dense, 'b t n c -> (b n) t c')
             dense = dense + self.feature_interp_attn_pos_embed.to(device=dense.device, dtype=dense.dtype)
+            dense = dense + self.feature_interp_attn_identifier_embed(
+                self.feature_interp_attn_identifier_ids.to(device=dense.device)
+            ).to(dtype=dense.dtype)
             dense = dense + self.feature_interp_attn(self.feature_interp_attn_norm(dense))
             dense = rearrange(dense, '(b n) t c -> b t n c', b=b, n=n)
             return self.head(dense)

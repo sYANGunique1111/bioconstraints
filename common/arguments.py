@@ -21,6 +21,12 @@ def parse_args():
     parser.add_argument('-lr', '--learning_rate', default=0.00006, type=float)
     parser.add_argument('-lrd', '--lr_decay', default=0.976, type=float)
     parser.add_argument('-f', '--number_of_frames', default=243, type=int)
+    parser.add_argument('--sequence_chunk_mode', default='center_pad', type=str,
+                        choices=['drop', 'center_pad', 'tail_pad', 'stride'],
+                        help='How to split frame sequences into fixed-length windows: '
+                             'drop keeps only full windows, center_pad uses centered edge padding, '
+                             'tail_pad pads only the final partial window on the right, '
+                             'stride uses ceil(N/L) windows with evenly distributed mixed strides')
     parser.add_argument('--loss_type', default='mpjpe', type=str, choices=['mpjpe', 'fweighted_mpjpe'],
                         help='Training loss: standard MPJPE or frame-weighted MPJPE')
     parser.add_argument('--train_stage', default=1, type=int, choices=[1, 2],
@@ -115,6 +121,19 @@ def parse_args():
                         help='Weight for left/right symmetry loss')
     parser.add_argument('--weight_angle', default=0.001, type=float,
                         help='Weight for joint angle limit loss (low to avoid dominating MPJPE)')
+    parser.add_argument('--weight_temporal_bone', default=0.0, type=float,
+                        help='Weight for temporal bone-length constancy loss')
+    parser.add_argument('--weight_temporal_symmetry', default=0.0, type=float,
+                        help='Weight for temporal average left/right symmetry loss')
+    parser.add_argument('--temporal_symmetry_tau', default=0.0005, type=float,
+                        help='Margin threshold for temporal symmetry loss in pose units')
+    parser.add_argument('--weight_joint_acc', default=0.0, type=float,
+                        help='Weight for top-k supervised joint acceleration loss')
+    parser.add_argument('--joint_acc_topk', default=25, type=int,
+                        help='Top-k joint-time acceleration entries selected per sample')
+    parser.add_argument('--joint_acc_loss_type', default='smooth_l1', type=str,
+                        choices=['smooth_l1', 'l1', 'mse', 'l2_norm'],
+                        help='Error function for top-k supervised joint acceleration loss')
     
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
 
